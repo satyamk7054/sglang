@@ -30,6 +30,7 @@ from transformers import (
 )
 
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.layers.pooling_types import PoolingType
 from sglang.srt.utils import load_image
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
@@ -89,7 +90,9 @@ def get_token_ids_logprobs(logits, token_ids):
     return logprobs
 
 
-def _get_sentence_transformer_embedding_model(model_path, torch_dtype):
+def _get_sentence_transformer_embedding_model(
+    model_path, torch_dtype, pooling_type=None
+):
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
 
@@ -98,13 +101,28 @@ def _get_sentence_transformer_embedding_model(model_path, torch_dtype):
             model_path,
             model_kwargs={"torch_dtype": torch_dtype},
         )
+
+        if pooling_type:
+            raise ValueError("Pooling override not supported")
+
     else:  # if no pre-trained sentence-transformers model
         from sentence_transformers import models
 
         word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+
+        # Fix padding token issue if it doesn't exist
+        if word_embedding_model.tokenizer.pad_token is None:
+            word_embedding_model.tokenizer.pad_token = (
+                word_embedding_model.tokenizer.eos_token
+            )
+
+        # Set pooling mode based on pooling_type parameter
+        pooling_mode = (
+            "mean" if pooling_type and pooling_type.upper() == "MEAN" else "lasttoken"
+        )
         pooling_model = models.Pooling(
             word_embedding_model.get_word_embedding_dimension(),
-            pooling_mode="lasttoken",
+            pooling_mode=pooling_mode,
         )
         model = SentenceTransformer(modules=[word_embedding_model, pooling_model])
 
@@ -135,14 +153,26 @@ class HFRunner:
         output_str_only: bool = False,
         trust_remote_code: bool = False,
         patch_model_do_sample_false: bool = False,
+        pooling_type: Optional[str] = None,
     ):
         self.model_type = model_type
         self.output_str_only = output_str_only
         self.trust_remote_code = trust_remote_code
         self.patch_model_do_sample_false = patch_model_do_sample_false
+        self.pooling_type = pooling_type
 
         self.in_queue = mp.Queue()
         self.out_queue = mp.Queue()
+
+        # Ensure subprocess inherits the current environment (including virtual env)
+        import sys
+
+        current_env = os.environ.copy()
+        if hasattr(sys, "real_prefix") or (
+            hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix
+        ):
+            # We're in a virtual environment, ensure subprocess uses it
+            current_env["PYTHONPATH"] = ":".join(sys.path)
 
         self.model_proc = mp.Process(
             target=self.start_model_process,
@@ -151,6 +181,7 @@ class HFRunner:
                 self.out_queue,
                 model_path,
                 torch_dtype,
+                self.pooling_type,
             ),
         )
         self.model_proc.start()
@@ -225,7 +256,27 @@ class HFRunner:
         embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
         return embeddings.contiguous()
 
-    def start_model_process(self, in_queue, out_queue, model_path, torch_dtype):
+    def start_model_process(
+        self, in_queue, out_queue, model_path, torch_dtype, pooling_type=None
+    ):
+        # Ensure the subprocess can find packages in the virtual environment
+        import os
+        import sys
+
+        # Add the virtual environment's site-packages to Python path if we're in a venv
+        venv_path = os.environ.get("VIRTUAL_ENV")
+        if venv_path:
+            import site
+
+            site_packages_dir = os.path.join(
+                venv_path,
+                "lib",
+                f"python{sys.version_info.major}.{sys.version_info.minor}",
+                "site-packages",
+            )
+            if os.path.exists(site_packages_dir) and site_packages_dir not in sys.path:
+                sys.path.insert(0, site_packages_dir)
+
         # Apply model-specific patches
         monkey_patch_gemma2_sdpa()
 
@@ -259,7 +310,7 @@ class HFRunner:
                 self.processor = AutoProcessor.from_pretrained(model_path)
             else:
                 self.model = _get_sentence_transformer_embedding_model(
-                    model_path, torch_dtype
+                    model_path, torch_dtype, pooling_type
                 )
         elif self.model_type == "reward" or self.model_type == "cross_encoder":
             from transformers import AutoModelForSequenceClassification
@@ -519,6 +570,7 @@ class SRTRunner:
         lora_target_modules: Optional[List[str]] = None,
         enable_lora: Optional[bool] = None,
         max_loaded_loras: Optional[int] = None,
+        pooling_type: PoolingType | None = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -565,6 +617,7 @@ class SRTRunner:
             lora_target_modules=lora_target_modules,
             enable_lora=enable_lora,
             max_loaded_loras=max_loaded_loras,
+            pooling_type=pooling_type.name if pooling_type else None,
             **spec_kwargs,
         )
 

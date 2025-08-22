@@ -23,6 +23,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.configs.model_config import PoolerConfig
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -36,7 +37,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.pooler import Pooler, PoolingType
+from sglang.srt.layers.pooler import Pooler
+from sglang.srt.layers.pooling_types import PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -416,6 +418,7 @@ class LlamaForCausalLM(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        pooler_config: Optional[PoolerConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -436,7 +439,11 @@ class LlamaForCausalLM(nn.Module):
                 use_attn_tp_group=global_server_args_dict["enable_dp_lm_head"],
             )
         self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
+        # Configure pooler using pooler_config with defaults
+        pooler_config = pooler_config or PoolerConfig()
+        pooler_config.merge_with_defaults(pooling_type=PoolingType.LAST, normalize=True)
+        self.pooler = Pooler.from_pooler_config(pooler_config)
         self.stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),

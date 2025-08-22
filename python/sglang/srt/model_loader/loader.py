@@ -8,6 +8,7 @@ import concurrent
 import dataclasses
 import fnmatch
 import glob
+import inspect
 import json
 import logging
 import math
@@ -249,10 +250,23 @@ def _initialize_model(
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping
     )
-    return model_class(
-        config=model_config.hf_config,
-        quant_config=quant_config,
-    )
+
+    # Check if the model constructor accepts pooler_config parameter
+    model_init_signature = inspect.signature(model_class.__init__)
+    model_kwargs = {
+        "config": model_config.hf_config,
+        "quant_config": quant_config,
+    }
+
+    # Only add pooler_config if the constructor accepts it
+    if "pooler_config" in model_init_signature.parameters:
+        model_kwargs["pooler_config"] = model_config.pooler_config
+    else:
+        logger.info(
+            f"Model constructor: {model_class.__name__} does not accept pooler_config parameter, pooler overrides will not take effect."
+        )
+
+    return model_class(**model_kwargs)
 
 
 class BaseModelLoader(ABC):

@@ -15,10 +15,12 @@
 import multiprocessing as mp
 import random
 import unittest
+from pathlib import Path
 
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
+from sglang.srt.layers.pooling_types import PoolingType
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import (
     CustomTestCase,
@@ -36,6 +38,8 @@ MODELS = [
     # ("jason9693/Qwen2.5-1.5B-apeach", 1, 1e-5),
 ]
 TORCH_DTYPES = [torch.float16]
+
+LOCAL_MODEL_FOR_MEAN_POOLING_TEST = "/shared/public/elr-models/meta-llama/Llama-3.2-3B/5cc0ffe09ee49f7be6ca7c794ee6bd7245e84e60/"
 
 
 class TestEmbeddingModels(CustomTestCase):
@@ -112,6 +116,50 @@ class TestEmbeddingModels(CustomTestCase):
                 self.assert_close_prefill_logits(
                     DEFAULT_PROMPTS, model, tp_size, torch_dtype, prefill_tolerance
                 )
+
+    @unittest.skipIf(
+        not Path(LOCAL_MODEL_FOR_MEAN_POOLING_TEST).exists(),
+        f"Model path {LOCAL_MODEL_FOR_MEAN_POOLING_TEST} does not exist",
+    )
+    def test_mean_pooling(self):
+        model_path = LOCAL_MODEL_FOR_MEAN_POOLING_TEST
+        torch_dtype = torch.float16
+        tp_size = 1
+        prompts = DEFAULT_PROMPTS
+
+        truncated_prompts = self._truncate_prompts(prompts, model_path)
+        prefill_tolerance = 1e-5
+
+        with HFRunner(
+            model_path,
+            torch_dtype=torch.float32,
+            model_type="embedding",
+            pooling_type="MEAN",
+        ) as hf_runner:
+            hf_outputs = hf_runner.forward(truncated_prompts)
+
+        with SRTRunner(
+            model_path,
+            tp_size=tp_size,
+            torch_dtype=torch_dtype,
+            model_type="embedding",
+            pooling_type=PoolingType.MEAN,
+            chunked_prefill_size=-1,  # Disable chunked prefill for mean pooling
+            disable_radix_cache=True,  # Disable radix cache
+        ) as srt_runner:
+            srt_outputs = srt_runner.forward(truncated_prompts)
+
+        for i in range(len(prompts)):
+            hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
+            srt_logits = torch.Tensor(srt_outputs.embed_logits[i])
+
+            similarity = torch.tensor(get_similarities(hf_logits, srt_logits))
+            print("similarity diff", abs(similarity - 1))
+
+            if len(prompts[i]) <= 1000:
+                assert torch.all(
+                    abs(similarity - 1) < prefill_tolerance
+                ), "embeddings are not all close"
 
 
 if __name__ == "__main__":

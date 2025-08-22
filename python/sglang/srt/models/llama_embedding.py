@@ -1,10 +1,12 @@
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
+from sglang.srt.configs.model_config import PoolerConfig
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler
+from sglang.srt.layers.pooling_types import PoolingType
 from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaModel
@@ -16,13 +18,18 @@ class LlamaEmbeddingModel(nn.Module):
         self,
         config: LlamaConfig,
         quant_config=None,
+        pooler_config: Optional[PoolerConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.model = LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+
+        # Configure pooler using pooler_config with defaults
+        pooler_config = pooler_config or PoolerConfig()
+        pooler_config.merge_with_defaults(pooling_type=PoolingType.LAST, normalize=True)
+        self.pooler = Pooler.from_pooler_config(pooler_config)
 
     @torch.no_grad()
     def forward(
