@@ -20,7 +20,7 @@ from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from sglang.srt.layers.pooling_types import PoolingType
+from sglang.srt.layers.pooler import PoolingType
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import (
     CustomTestCase,

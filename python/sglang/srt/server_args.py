@@ -24,7 +24,7 @@ from typing import Dict, List, Literal, Optional, Union
 
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.layers.pooling_types import PoolingType
+from sglang.srt.layers.pooler import PoolingType
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
@@ -456,7 +456,7 @@ class ServerArgs:
     enable_pdmux: bool = False
     sm_group_num: int = 3
 
-    # Embedding pooling configs
+    # Pooling type to use for the embedding model
     pooling_type: Optional[str] = None
 
     def __post_init__(self):
@@ -530,15 +530,6 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
-
-        if self.pooling_type == PoolingType.MEAN.name:
-            # Mean pooling requires all the hidden states to be available, but with KV caching / chunking,
-            # the hidden states passed to the pooler are only for the new tokens
-            if self.chunked_prefill_size != -1:
-                raise ValueError(f"Chunked prefill must be disabled with mean pooling")
-
-            if not self.disable_radix_cache:
-                raise ValueError(f"Radix cache must be disabled with mean pooling")
 
     def _handle_deprecated_args(self):
         # handle deprecated tool call parsers
@@ -1303,6 +1294,16 @@ class ServerArgs:
 
     def _handle_other_validations(self):
         pass
+
+    def _handle_embedding_model_args(self):
+        if self.pooling_type == PoolingType.MEAN.name:
+            # Mean pooling requires all the hidden states to be available, but with KV caching / chunking,
+            # the hidden states passed to the pooler are only for the new tokens
+            if self.chunked_prefill_size != -1:
+                raise ValueError(f"Chunked prefill must be disabled with mean pooling")
+
+            if not self.disable_radix_cache:
+                raise ValueError(f"Radix cache must be disabled with mean pooling")
 
     def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
         larger_tp = max(decode_tp, prefill_tp)

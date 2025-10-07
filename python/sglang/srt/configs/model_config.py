@@ -23,7 +23,7 @@ import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.pooling_types import PoolingType
+from sglang.srt.layers.pooler import PoolingConfig
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
@@ -72,34 +72,6 @@ def get_nsa_index_topk(config: PretrainedConfig) -> int:
 def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_n_heads
-
-
-class PoolerConfig:
-    def __init__(
-        self, pooling_type: PoolingType | None = None, normalize: bool | None = None
-    ):
-        self.pooling_type = pooling_type
-        self.normalize = normalize
-
-    @staticmethod
-    def from_server_args(server_args: ServerArgs):
-        return PoolerConfig(
-            pooling_type=(
-                PoolingType[server_args.pooling_type]
-                if server_args.pooling_type
-                else None
-            ),
-        )
-
-    def merge_with_defaults(
-        self, pooling_type: PoolingType, normalize: bool
-    ) -> "PoolerConfig":
-        """Method to merge with model-specific defaults if the config(s) are not passed by the user"""
-
-        self.pooling_type = self.pooling_type or pooling_type
-        self.normalize = self.normalize if self.normalize is not None else normalize
-
-        return self
 
 
 class ModelConfig:
@@ -224,7 +196,7 @@ class ModelConfig:
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
 
-        self.pooler_config = pooler_config
+        self.pooler_config: PoolerConfig = pooler_config
 
     @staticmethod
     def from_server_args(
@@ -246,6 +218,7 @@ class ModelConfig:
             modelopt_quant=server_args.modelopt_quant,
             hybrid_kvcache_ratio=server_args.hybrid_kvcache_ratio,
             model_impl=server_args.model_impl,
+            pooler_config=PoolerConfig.from_server_args(server_args),
             **kwargs,
         )
 
