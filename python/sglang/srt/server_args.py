@@ -24,7 +24,6 @@ from typing import Dict, List, Literal, Optional, Union
 
 from sglang.srt.connector import ConnectorType
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
-from sglang.srt.layers.pooler import PoolingType
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import (
@@ -2905,6 +2904,8 @@ class ServerArgs:
         )
 
         # Embedding pooling configs
+        from sglang.srt.layers.pooler import PoolingType
+
         parser.add_argument(
             "--pooling-type",
             type=str,

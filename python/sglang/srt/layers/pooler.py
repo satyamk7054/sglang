@@ -2,6 +2,7 @@
 # https://github.com/vllm-project/vllm/blob/82a1b1a82b1fbb454c82a9ef95730b929c9b270c/vllm/model_executor/layers/pooler.py
 
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Optional
 
 import torch
@@ -9,9 +10,45 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
-from sglang.srt.layers.pooler import PoolingType
-from sglang.srt.layers.pooler.pooler_config import PoolerConfig
 from sglang.srt.model_executor.model_runner import ForwardBatch
+from sglang.srt.server_args import ServerArgs
+
+
+class PoolingType(IntEnum):
+    LAST = 0
+    CLS = 1
+    MEAN = 2
+
+
+class PoolerConfig:
+    def __init__(
+        self, pooling_type: PoolingType | None = None, normalize: bool | None = None
+    ):
+        self.pooling_type = pooling_type
+
+        # None is different from False because different models have different defaults
+        # for unset 'normalize' config to maintain backward compatibility
+        self.normalize = normalize
+
+    @staticmethod
+    def from_server_args(server_args: ServerArgs):
+        return PoolerConfig(
+            pooling_type=(
+                PoolingType[server_args.pooling_type]
+                if server_args.pooling_type
+                else None
+            ),
+        )
+
+    def merge_with_defaults(
+        self, pooling_type: PoolingType, normalize: bool
+    ) -> "PoolerConfig":
+        """Method to merge with model-specific defaults if the config(s) are not passed by the user"""
+
+        self.pooling_type = self.pooling_type or pooling_type
+        self.normalize = self.normalize if self.normalize is not None else normalize
+
+        return self
 
 
 @dataclass
