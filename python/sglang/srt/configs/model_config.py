@@ -23,7 +23,7 @@ import torch
 from transformers import PretrainedConfig
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.pooler import PoolingConfig
+from sglang.srt.layers.pooler.config import PoolingConfig
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
@@ -196,7 +196,7 @@ class ModelConfig:
             self.hf_config, "image_token_id", None
         ) or getattr(self.hf_config, "image_token_index", None)
 
-        self.pooler_config: PoolerConfig = pooler_config
+        self.pooler_config = pooler_config
 
     @staticmethod
     def from_server_args(
