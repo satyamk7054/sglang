@@ -528,6 +528,9 @@ class ServerArgs:
         # Handle deterministic inference.
         self._handle_deterministic_inference()
 
+        # Validate for embedding model configurations.
+        self._handle_embedding_model_args()
+
         # Handle any other necessary validations.
         self._handle_other_validations()
 
@@ -1304,14 +1307,6 @@ class ServerArgs:
 
             if not self.disable_radix_cache:
                 raise ValueError(f"Radix cache must be disabled with mean pooling")
-
-    def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
-        larger_tp = max(decode_tp, prefill_tp)
-        smaller_tp = min(decode_tp, prefill_tp)
-        assert larger_tp % smaller_tp == 0, (
-            "Different tp size is supported only when one tp is multiple of the other. "
-            f"decode_tp={decode_tp}, prefill_tp={prefill_tp}"
-        )
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

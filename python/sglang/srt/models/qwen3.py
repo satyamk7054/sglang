@@ -15,7 +15,8 @@ from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.pooler import Pooler, PoolerConfig, PoolingType
+from sglang.srt.layers.pooler import Pooler, PoolingType
+from sglang.srt.layers.pooler.config import PoolingConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope

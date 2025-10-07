@@ -36,7 +36,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.layers.pooler import Pooler, PoolerConfig, PoolingType
+from sglang.srt.layers.pooler import Pooler, PoolingType
+from sglang.srt.layers.pooler.config import PoolingConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope

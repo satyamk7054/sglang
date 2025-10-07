@@ -4,12 +4,8 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from sglang.srt.layers.pooler import (
-    EmbeddingPoolerOutput,
-    Pooler,
-    PoolerConfig,
-    PoolingType,
-)
+from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
+from sglang.srt.layers.pooler.config import PoolingConfig
 from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaModel
