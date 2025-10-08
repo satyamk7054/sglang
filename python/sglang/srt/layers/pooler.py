@@ -9,46 +9,15 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.pooler_config import PoolerConfig
 from sglang.srt.layers.activation import get_cross_encoder_activation_function
 from sglang.srt.model_executor.model_runner import ForwardBatch
-from sglang.srt.server_args import ServerArgs
 
 
 class PoolingType(IntEnum):
     LAST = 0
     CLS = 1
     MEAN = 2
-
-
-class PoolerConfig:
-    def __init__(
-        self, pooling_type: PoolingType | None = None, normalize: bool | None = None
-    ):
-        self.pooling_type = pooling_type
-
-        # None is different from False because different models have different defaults
-        # for unset 'normalize' config to maintain backward compatibility
-        self.normalize = normalize
-
-    @staticmethod
-    def from_server_args(server_args: ServerArgs):
-        return PoolerConfig(
-            pooling_type=(
-                PoolingType[server_args.pooling_type]
-                if server_args.pooling_type
-                else None
-            ),
-        )
-
-    def merge_with_defaults(
-        self, pooling_type: PoolingType, normalize: bool
-    ) -> "PoolerConfig":
-        """Method to merge with model-specific defaults if the config(s) are not passed by the user"""
-
-        self.pooling_type = self.pooling_type or pooling_type
-        self.normalize = self.normalize if self.normalize is not None else normalize
-
-        return self
 
 
 @dataclass
@@ -74,8 +43,10 @@ class Pooler(nn.Module):
 
     @staticmethod
     def from_pooler_config(config: PoolerConfig) -> "Pooler":
+        print(config.pooling_type)
+        print(type(config.pooling_type))
         return Pooler(
-            pooling_type=config.pooling_type,
+            pooling_type=PoolingType[config.pooling_type],
             normalize=config.normalize,
         )
 

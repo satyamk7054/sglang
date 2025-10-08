@@ -1298,7 +1298,7 @@ class ServerArgs:
         pass
 
     def _handle_embedding_model_args(self):
-        if self.pooling_type == PoolingType.MEAN.name:
+        if self.pooling_type == "MEAN":
             # Mean pooling requires all the hidden states to be available, but with KV caching / chunking,
             # the hidden states passed to the pooler are only for the new tokens
             if self.chunked_prefill_size != -1:

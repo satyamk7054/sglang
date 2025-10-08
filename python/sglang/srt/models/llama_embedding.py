@@ -4,8 +4,8 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.configs.pooler_config import PoolerConfig
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
-from sglang.srt.layers.pooler.config import PoolingConfig
 from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaModel
@@ -29,7 +29,7 @@ class LlamaEmbeddingModel(nn.Module):
         pooler_config = pooler_config or PoolerConfig()
         self.pooler = Pooler.from_pooler_config(
             pooler_config.merge_with_defaults(
-                pooling_type=PoolingType.LAST, normalize=True
+                pooling_type=PoolingType.LAST.name, normalize=True
             )
         )
 

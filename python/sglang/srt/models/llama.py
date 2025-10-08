@@ -23,6 +23,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.configs.pooler_config import PoolerConfig
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -37,7 +38,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.pooler import Pooler, PoolingType
-from sglang.srt.layers.pooler.config import PoolingConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -443,7 +443,7 @@ class LlamaForCausalLM(nn.Module):
         pooler_config = pooler_config or PoolerConfig()
         self.pooler = Pooler.from_pooler_config(
             pooler_config.merge_with_defaults(
-                pooling_type=PoolingType.LAST, normalize=True
+                pooling_type=PoolingType.LAST.name, normalize=True
             )
         )
         self.stacked_params_mapping = [

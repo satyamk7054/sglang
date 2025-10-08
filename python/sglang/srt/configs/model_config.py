@@ -22,8 +22,8 @@ from typing import Dict, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.pooler_config import PoolerConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.pooler.config import PoolingConfig
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, retry
