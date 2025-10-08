@@ -2904,6 +2904,7 @@ class ServerArgs:
         )
 
         # Embedding pooling configs
+        # Lazy init to avoid circular import
         from sglang.srt.layers.pooler import PoolingType
 
         parser.add_argument(

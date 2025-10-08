@@ -43,8 +43,9 @@ class Pooler(nn.Module):
 
     @staticmethod
     def from_pooler_config(config: PoolerConfig) -> "Pooler":
-        print(config.pooling_type)
-        print(type(config.pooling_type))
+        assert config.pooling_type is not None, "pooling_type must be set"
+        assert config.normalize is not None, "normalize must be set"
+
         return Pooler(
             pooling_type=PoolingType[config.pooling_type],
             normalize=config.normalize,
