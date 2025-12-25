@@ -46,8 +46,8 @@ DEFAULT_PROMPTS = [
     "Today is a sunny day and I like",
     "AI is a field of computer science focused on",
     # the output of gemma-2-2b from SRT is unstable on the commented prompt
-    # "The capital of France is",
-]
+    "The capital of France is",
+] * 500
 TEST_RERANK_QUERY_DOCS = [
     {
         "query": "How many people live in Berlin?",

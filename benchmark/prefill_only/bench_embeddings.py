@@ -39,8 +39,10 @@ logger = logging.getLogger(__name__)
 ###############################################################################
 # Create benchmark configuration
 config = BenchmarkConfig()
-config.rps_values = [500]
-config.duration_secs_values = [60]
+config.rps_values = [40]
+
+# 12 hours
+config.duration_secs_values = [12 * 60 * 60]
 config.num_unique_requests = 100
 config.distribution = "POISSON"
 config.profile = False
@@ -53,11 +55,11 @@ config.freeze_gc = True  # Enable GC freeze functionality
 HTTP_URL = "http://localhost:30000/v1/embeddings"
 
 # Embeddings API Config
-EMBEDDINGS_MODEL_PATH = "Qwen/Qwen3-Embedding-0.6B"
+EMBEDDINGS_MODEL_PATH = "/home/jobuser/models/Qwen3-Embedding-0.6B"
 BATCH_SIZE = [1]  # Number of items per request (batch size)
 
 # Configurable input token length
-EMBEDDINGS_INPUT_TOKENS = 500  # Default token length
+EMBEDDINGS_INPUT_TOKENS = 6 * 1024  # Default token length
 MATRYOSHKA_DIMENSIONS: Optional[int] = (
     None  # Set to None to disable matryoshka embeddings
 )

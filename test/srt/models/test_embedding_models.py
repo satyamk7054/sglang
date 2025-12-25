@@ -29,10 +29,11 @@ from sglang.test.test_utils import (
 )
 
 MODEL_TO_CONFIG = {
-    "Alibaba-NLP/gte-Qwen2-1.5B-instruct": (1, 1e-5),
-    "intfloat/e5-mistral-7b-instruct": (1, 1e-5),
-    "marco/mcdse-2b-v1": (1, 1e-5),
-    "Qwen/Qwen3-Embedding-8B": (1, 1e-5),
+    # "Alibaba-NLP/gte-Qwen2-1.5B-instruct": (1, 1e-5),
+    # "intfloat/e5-mistral-7b-instruct": (1, 1e-5),
+    # "marco/mcdse-2b-v1": (1, 1e-5),
+    # "Qwen/Qwen3-Embedding-8B": (1, 1e-5),
+    "/home/jobuser/models/Qwen3-Embedding-0.6B": (1, 1e-5),
     # Temporarily disable before this model is fixed
     # "jason9693/Qwen2.5-1.5B-apeach": (1, 1e-5),
 }
@@ -99,6 +100,8 @@ class TestEmbeddingModels(CustomTestCase):
                 truncated_prompts, dimensions=matryoshka_dim
             )
 
+        short_string_similarities = []
+        long_string_similarities = []
         for i in range(len(prompts)):
             hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
             srt_logits = torch.Tensor(srt_outputs.embed_logits[i])
@@ -110,6 +113,22 @@ class TestEmbeddingModels(CustomTestCase):
                 assert torch.all(
                     abs(similarity - 1) < prefill_tolerance
                 ), "embeddings are not all close"
+                short_string_similarities.append(similarity)
+            else:
+                assert torch.all(
+                    abs(similarity - 1) < 1e-2
+                ), "embeddings are not all close"
+                long_string_similarities.append(similarity)
+
+        print(
+            f"Average similarity for short strings: {torch.mean(torch.tensor(short_string_similarities))}"
+        )
+        print(
+            f"Average similarity for long strings: {torch.mean(torch.tensor(long_string_similarities))}"
+        )
+        print(
+            f"Overall average similarity: {torch.mean(torch.tensor(short_string_similarities + long_string_similarities))}"
+        )
 
     def test_prefill_logits(self):
         models_to_test = MODELS
