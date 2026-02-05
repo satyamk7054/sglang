@@ -317,7 +317,9 @@ class SchedulerOutputProcessorMixin:
                 if req.is_retracted:
                     continue
 
-                req.embedding = embeddings[i]
+                req.embedding = self._convert_emb_based_on_format(
+                    embeddings[i], req.encoding_format
+                )
                 if req.is_chunked <= 0:
                     # Dummy output token for embedding models
                     req.output_ids.append(0)
@@ -428,6 +430,15 @@ class SchedulerOutputProcessorMixin:
                 running_bs_offline_batch=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+
+    @staticmethod
+    def _convert_emb_based_on_format(
+        embedding: torch.Tensor, encoding_format: Optional[str]
+    ) -> Union[torch.Tensor, list[float]]:
+        if encoding_format is None or encoding_format.lower() == "float":
+            return embedding.tolist()
+        else:
+            return embedding
 
     def process_batch_result_decode(
         self: Scheduler,

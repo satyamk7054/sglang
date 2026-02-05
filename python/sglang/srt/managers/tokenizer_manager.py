@@ -959,6 +959,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 priority=obj.priority,
                 dimensions=obj.dimensions,
                 http_worker_ipc=obj.http_worker_ipc,
+                encoding_format=obj.encoding_format,
             )
 
         return tokenized_obj

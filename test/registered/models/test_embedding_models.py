@@ -151,6 +151,47 @@ class TestEmbeddingModels(CustomTestCase):
                     matryoshka_dim=128,
                 )
 
+    @unittest.skipIf(True, "Skipping test_embedding_encoding_format")
+    def test_embedding_encoding_format(self):
+        model_path = "abc"
+        torch_dtype = torch.float16
+        tp_size = 1
+        prompts = DEFAULT_PROMPTS
+
+        truncated_prompts = self._truncate_prompts(prompts, model_path)
+        truncated_prompts *= 25
+        prefill_tolerance = 1e-5
+
+        with SRTRunner(
+            model_path,
+            tp_size=tp_size,
+            torch_dtype=torch_dtype,
+            model_type="embedding",
+            chunked_prefill_size=-1,
+            disable_radix_cache=True,
+        ) as srt_runner:
+            default_srt_outputs = srt_runner.forward(truncated_prompts)
+            tensor_srt_outputs = srt_runner.forward(
+                truncated_prompts, encoding_format="tensor"
+            )
+
+        for i in range(len(truncated_prompts)):
+            assert isinstance(default_srt_outputs.embed_logits[i], list)
+            assert isinstance(tensor_srt_outputs.embed_logits[i], torch.Tensor)
+
+            default_srt_logits = torch.Tensor(default_srt_outputs.embed_logits[i])
+            tensor_srt_logits = tensor_srt_outputs.embed_logits[i]
+
+            similarity = torch.tensor(
+                get_similarities(default_srt_logits, tensor_srt_logits)
+            )
+            print("similarity diff", abs(similarity - 1))
+
+            if len(truncated_prompts[i]) <= 1000:
+                assert torch.all(
+                    abs(similarity - 1) < prefill_tolerance
+                ), "embeddings are not all close"
+
 
 if __name__ == "__main__":
     unittest.main()

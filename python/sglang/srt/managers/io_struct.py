@@ -27,6 +27,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 
 import torch
 
+import torch
+
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import BaseFinishReason
 from sglang.srt.multimodal.mm_utils import has_valid_data
@@ -824,6 +826,10 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
 
+    # Encoding format to return the response in. Possible values are: "float", "tensor", "base64",
+    # etc. Default is "float" which corresponds to list[float] return type per embedding.
+    encoding_format: Optional[str] = None
+
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
         if self.text is None and self.input_ids is None and self.image_data is None:
@@ -903,6 +909,7 @@ class EmbeddingReqInput(BaseReq, APIServingTimingMixin):
             external_trace_header=self.external_trace_header,
             dimensions=self.dimensions,
             http_worker_ipc=self.http_worker_ipc,
+            encoding_format=self.encoding_format,
             **{
                 field: getattr(self, field)
                 for field in _API_SERVING_TIMING_MIXIN_FIELDS
@@ -928,6 +935,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
     priority: Optional[int] = None
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
+    # Encoding format to return the response in.
+    encoding_format: Optional[str] = None
 
 
 @dataclass
@@ -1132,7 +1141,7 @@ class BatchEmbeddingOutput(BaseBatchReq, RequestTimingMetricsMixin):
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # The output embedding
-    embeddings: Union[List[List[float]], List[Dict[int, float]]]
+    embeddings: Union[List[List[float]], List[Dict[int, float]], List[torch.Tensor]]
     # Token counts
     prompt_tokens: List[int]
     cached_tokens: List[int]

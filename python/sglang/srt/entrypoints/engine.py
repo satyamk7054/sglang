@@ -381,6 +381,7 @@ class Engine(EngineBase):
         dimensions: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        encoding_format: Optional[str] = None,
     ) -> Dict:
         """
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::EmbeddingReqInput`.
@@ -394,6 +395,7 @@ class Engine(EngineBase):
             dimensions=dimensions,
             external_trace_header=external_trace_header,
             rid=rid,
+            encoding_format=encoding_format,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = self.loop.run_until_complete(generator.__anext__())
@@ -408,6 +410,7 @@ class Engine(EngineBase):
         dimensions: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
+        encoding_format: Optional[str] = None,
     ) -> Dict:
         """
         Asynchronous version of encode method.
@@ -423,6 +426,7 @@ class Engine(EngineBase):
             dimensions=dimensions,
             external_trace_header=external_trace_header,
             rid=rid,
+            encoding_format=encoding_format,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
         return await generator.__anext__()

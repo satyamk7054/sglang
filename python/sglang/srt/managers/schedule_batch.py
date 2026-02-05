@@ -543,6 +543,7 @@ class Req:
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        encoding_format: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -807,6 +808,9 @@ class Req:
         self.dllm_ids = []
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
+
+        # Encoding format for the embedding response
+        self.encoding_format = encoding_format
 
     @property
     def seqlen(self) -> int:

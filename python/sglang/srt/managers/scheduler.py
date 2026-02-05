@@ -1764,6 +1764,7 @@ class Scheduler(
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
             http_worker_ipc=recv_req.http_worker_ipc,
+            encoding_format=recv_req.encoding_format,
         )
         req.tokenizer = self.tokenizer
 
