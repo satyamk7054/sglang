@@ -307,10 +307,11 @@ class SchedulerOutputProcessorMixin:
                         i
                     ].item()
             else:
-                if isinstance(embeddings, torch.Tensor):
-                    embeddings = embeddings.tolist()
-                else:
-                    embeddings = [tensor.tolist() for tensor in embeddings]
+                # if isinstance(embeddings, torch.Tensor):
+                #     embeddings = embeddings.tolist()
+                # else:
+                #     embeddings = [tensor.tolist() for tensor in embeddings]
+                pass
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -435,7 +436,9 @@ class SchedulerOutputProcessorMixin:
     def _convert_emb_based_on_format(
         embedding: torch.Tensor, encoding_format: Optional[str]
     ) -> Union[torch.Tensor, list[float]]:
-        if encoding_format is None or encoding_format.lower() == "float":
+        if (
+            encoding_format is None or encoding_format.lower() == "float"
+        ) and isinstance(embedding, torch.Tensor):
             return embedding.tolist()
         else:
             return embedding

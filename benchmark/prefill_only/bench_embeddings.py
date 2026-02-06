@@ -39,10 +39,10 @@ logger = logging.getLogger(__name__)
 ###############################################################################
 # Create benchmark configuration
 config = BenchmarkConfig()
-config.rps_values = [500]
-config.duration_secs_values = [60]
+config.rps_values = [350]
+config.duration_secs_values = [30]
 config.num_unique_requests = 100
-config.distribution = "POISSON"
+config.distribution = "CONSTANT"
 config.profile = False
 config.freeze_gc = True  # Enable GC freeze functionality
 # Profiler output directory - by default uses present working directory (pwd)
@@ -57,7 +57,7 @@ EMBEDDINGS_MODEL_PATH = "Qwen/Qwen3-Embedding-0.6B"
 BATCH_SIZE = [1]  # Number of items per request (batch size)
 
 # Configurable input token length
-EMBEDDINGS_INPUT_TOKENS = 500  # Default token length
+EMBEDDINGS_INPUT_TOKENS = 512  # Default token length
 MATRYOSHKA_DIMENSIONS: Optional[int] = (
     None  # Set to None to disable matryoshka embeddings
 )
