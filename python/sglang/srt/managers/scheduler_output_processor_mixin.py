@@ -435,13 +435,13 @@ class SchedulerOutputProcessorMixin:
     @staticmethod
     def _convert_emb_based_on_format(
         embedding: torch.Tensor, encoding_format: Optional[str]
-    ) -> Union[torch.Tensor, list[float]]:
+    ) -> Union[bytes, list[float]]:
         if (
             encoding_format is None or encoding_format.lower() == "float"
         ) and isinstance(embedding, torch.Tensor):
             return embedding.tolist()
         else:
-            return embedding
+            return embedding.to(torch.float32).numpy().tobytes()
 
     def process_batch_result_decode(
         self: Scheduler,

@@ -22,7 +22,6 @@ import time
 from typing import Any, Dict, Optional
 
 import numpy as np
-import torch
 from transformers import AutoTokenizer
 
 from sglang import Engine
@@ -35,6 +34,10 @@ TARGET_RPS_VALUES = [350]  # Target requests per second to test
 DURATION_SECS = 30  # Duration of each benchmark run in seconds
 BATCH_SIZE = 1  # Number of texts per request
 
+PROFILE = False
+if PROFILE:
+    DURATION_SECS = 1
+
 # Model Configuration
 MODEL_PATH = "/home/jobuser/models/Qwen3-Embedding-0.6B/"
 EMBEDDING_DIM = None  # Set to None for full dimension, or specify matryoshka dimension
@@ -45,8 +48,8 @@ INPUT_TOKEN_LENGTH = 512  # Number of tokens in input text
 # Encoding Format - determines return type
 # None or "tensor" -> returns torch.Tensor (engine-only path)
 # "float" -> returns list[float]
-ENCODING_FORMAT = "tensor"
-# ENCODING_FORMAT = None
+# ENCODING_FORMAT = "tensor"
+ENCODING_FORMAT = None
 
 # Distribution
 DISTRIBUTION = "CONSTANT"  # "CONSTANT" or "POISSON"
@@ -119,6 +122,11 @@ async def send_request(
             dimensions=dimensions,
         )
 
+        if encoding_format is None:
+            result["embedding"] = np.asarray(
+                result["embedding"], dtype=np.float32
+            ).tobytes()
+
         # Record time immediately after await completes
         after_await_time = time.perf_counter()
 
@@ -129,18 +137,19 @@ async def send_request(
 
             # Check format based on encoding_format
             if encoding_format == "tensor":
-                if not isinstance(embedding, torch.Tensor):
-                    print(f"Warning: Expected torch.Tensor but got {type(embedding)}")
+                if not isinstance(embedding, bytes):
+                    print(f"Warning: Expected bytes but got {type(embedding)}")
                     success = False
                 else:
                     # Validate device type (accessing .device doesn't cause GPU sync)
-                    device_type = embedding.device.type
-                    if device_type not in ["cpu"]:
-                        print(f"Warning: Unexpected device type: {device_type}")
-                        success = False
+                    # device_type = embedding.device.type
+                    # if device_type not in ["cpu"]:
+                    #     print(f"Warning: Unexpected device type: {device_type}")
+                    #     success = False
+                    pass
             elif encoding_format == "float" or encoding_format is None:
-                if not isinstance(embedding, list):
-                    print(f"Warning: Expected list but got {type(embedding)}")
+                if not isinstance(embedding, bytes):
+                    print(f"Warning: Expected bytes but got {type(embedding)}")
                     success = False
             else:
                 raise ValueError(f"Unknown encoding format: {encoding_format}")
@@ -256,6 +265,9 @@ async def run_benchmark(
 
     results_queue = asyncio.Queue()
 
+    if PROFILE:
+        await engine.tokenizer_manager.start_profile()
+
     # Start sending requests
     benchmark_start = time.perf_counter()
     send_times = await request_sender(
@@ -279,6 +291,9 @@ async def run_benchmark(
 
     benchmark_end = time.perf_counter()
     total_duration = benchmark_end - benchmark_start
+
+    if PROFILE:
+        await engine.tokenizer_manager.stop_profile()
 
     # Calculate metrics
     successful = [r for r in results if r["success"]]
