@@ -466,6 +466,8 @@ class Envs:
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     # fmt: on
 
+    SGLANG_TEST_SKIP_DETOKENIZER = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

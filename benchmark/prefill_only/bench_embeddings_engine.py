@@ -30,7 +30,7 @@ from sglang import Engine
 ###############################################################################
 # Benchmark Configuration
 ###############################################################################
-TARGET_RPS_VALUES = [350]  # Target requests per second to test
+TARGET_RPS_VALUES = [920]  # Target requests per second to test
 DURATION_SECS = 30  # Duration of each benchmark run in seconds
 BATCH_SIZE = 1  # Number of texts per request
 
@@ -48,8 +48,8 @@ INPUT_TOKEN_LENGTH = 512  # Number of tokens in input text
 # Encoding Format - determines return type
 # None or "tensor" -> returns torch.Tensor (engine-only path)
 # "float" -> returns list[float]
-# ENCODING_FORMAT = "tensor"
-ENCODING_FORMAT = None
+ENCODING_FORMAT = "tensor"
+# ENCODING_FORMAT = None
 
 # Distribution
 DISTRIBUTION = "CONSTANT"  # "CONSTANT" or "POISSON"

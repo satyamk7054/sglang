@@ -329,6 +329,7 @@ class Scheduler(
 
         # Init model configs
         self.init_model_config()
+        self.is_generation = self.model_config.is_generation
 
         # Init metrics stats
         self.init_metrics(tp_rank, pp_rank, dp_rank)
@@ -419,8 +420,12 @@ class Scheduler(
             send_to_tokenizer = get_zmq_socket(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
-            if self.server_args.skip_tokenizer_init:
+            if self.server_args.skip_tokenizer_init or (
+                not self.is_generation and envs.SGLANG_TEST_SKIP_DETOKENIZER.get()
+            ):
                 # Directly send to the TokenizerManager
+                logger.info("Skipping detokenizer initialization")
+                print("Skipping detokenizer initialization")
                 send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
@@ -453,7 +458,6 @@ class Scheduler(
 
     def init_tokenizer(self):
         server_args = self.server_args
-        self.is_generation = self.model_config.is_generation
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
