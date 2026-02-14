@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
@@ -207,6 +212,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: W8A8Fp8Config):
         self.quant_config = quant_config
+        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
 
     def create_weights(
         self,
@@ -271,6 +277,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Keep weights in FP8 format - matmul_ogs supports FP8 natively
         layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
         layer.w13_weight_scale = Parameter(
@@ -284,7 +291,12 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        backend = (
+            MoeRunnerBackend.TRITON_KERNELS
+            if self.use_triton_kernels
+            else MoeRunnerBackend.TRITON
+        )
+        self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
         self,
@@ -292,14 +304,45 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        quant_info = TritonMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            use_fp8_w8a8=True,
-            per_channel_quant=True,
-            w13_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a13_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-        )
+        backend = self.runner.runner_backend
+        if backend.is_triton_kernels():
+            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+            from triton_kernels.numerics import InFlexData
+
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
+            assert (
+                layer.moe_ep_size == 1
+            ), "Expert parallel is not supported when using triton kernels with w8a8fp8"
+
+            w13_precision_config = PrecisionConfig(
+                weight_scale=layer.w13_weight_scale,
+                flex_ctx=FlexCtx(rhs_data=InFlexData()),
+            )
+            w2_precision_config = PrecisionConfig(
+                weight_scale=layer.w2_weight_scale,
+                flex_ctx=FlexCtx(rhs_data=InFlexData()),
+            )
+
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_bias=None,
+                w2_bias=None,
+                w13_precision_config=w13_precision_config,
+                w2_precision_config=w2_precision_config,
+            )
+        else:
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8_w8a8=True,
+                per_channel_quant=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
+            )
         return self.runner.run(dispatch_output, quant_info)

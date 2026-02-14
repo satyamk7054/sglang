@@ -255,9 +255,10 @@ def triton_kernel_fused_experts_with_bias(
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
     for w in (w1, w2):
-        # TODO assert bf16 or mxfp4
-        # assert (w.dtype == torch.bfloat16) or check-is-mxfp4, f"w must be bfloat16 or mxfp4 {w1.dtype=}"
-        pass
+        assert (
+            w.dtype in [torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]
+            or w.element_size() == 0.5
+        ), f"w must be bfloat16, fp8, or mxfp4, got {w.dtype}"
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
@@ -276,7 +277,6 @@ def triton_kernel_fused_experts_with_bias(
     if global_num_experts == -1:
         global_num_experts = E
 
-    # TODO maybe completely remove this branch
     if w1.dtype == torch.bfloat16:
         device = "cuda"
         optg = dict()
@@ -285,6 +285,7 @@ def triton_kernel_fused_experts_with_bias(
 
         w2, w2_flex = quantize(w2, "bf16", device, **optg)
         w2_pcg = PrecisionConfig(flex_ctx=FlexCtx(rhs_data=w2_flex))
+    # else: weights are quantized (mxfp4 or fp8), w1_pcg/w2_pcg provided by caller
 
     act = FusedActivation(
         FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
