@@ -131,12 +131,23 @@ def get_model_config(
         intermediate_size, tp_size, ep_size
     )
 
+    # Handle dtype similar to server_args: force bfloat16 for MXFP4 quantization
+    dtype = config.torch_dtype
+    if (
+        hasattr(config, "quantization_config")
+        and config.quantization_config is not None
+    ):
+        quant_method = config.quantization_config.get("quant_method", None)
+        if quant_method == "mxfp4":
+            # Use bfloat16 for MXFP4 triton kernels (matches server_args behavior)
+            dtype = torch.bfloat16
+
     return {
         "num_experts": E,
         "topk": topk,
         "hidden_size": hidden_size,
         "shard_intermediate_size": shard_intermediate_size,
-        "dtype": config.torch_dtype,
+        "dtype": dtype,
         "block_shape": block_shape,
         "architecture": architecture,
     }

@@ -496,6 +496,8 @@ class ServerArgs:
         "none", "deepep", "mooncake", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
+    enable_adaptive_moe: bool = False
+    adaptive_moe_batch_threshold: int = 1536
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
@@ -4096,6 +4098,21 @@ class ServerArgs:
             choices=MOE_RUNNER_BACKEND_CHOICES,
             default=ServerArgs.moe_runner_backend,
             help="Choose the runner backend for MoE.",
+        )
+        parser.add_argument(
+            "--enable-adaptive-moe",
+            action="store_true",
+            help="Enable adaptive MoE kernel selection based on batch size. "
+            "Automatically switches between triton (fast for small batches) and "
+            "triton_kernels (fast for large batches) backends.",
+        )
+        parser.add_argument(
+            "--adaptive-moe-batch-threshold",
+            type=int,
+            default=ServerArgs.adaptive_moe_batch_threshold,
+            help="Batch size threshold for adaptive MoE kernel selection. "
+            "Use triton for batch_size < threshold, triton_kernels for batch_size >= threshold. "
+            "Default is 1536.",
         )
         parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",

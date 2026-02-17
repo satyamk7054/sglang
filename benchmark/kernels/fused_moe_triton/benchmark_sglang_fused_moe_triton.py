@@ -92,7 +92,7 @@ def fused_moe_sglang_api(
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["batch_size"],
-        x_vals=list([128, 256, 512, 1024, 2048, 4096, 8192]),
+        x_vals=list([8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]),
         line_arg="provider",
         line_vals=[
             "sglang_fused_moe_triton_v340",
@@ -232,6 +232,7 @@ def main():
         )
 
         model_config = get_model_config(args.model, args.tp_size, args.ep_size)
+        print(model_config)
         benchmark.run(
             show_plots=True,
             print_data=True,

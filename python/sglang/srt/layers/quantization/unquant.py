@@ -164,6 +164,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self._cache_permute_indices = dict({})
+        self.use_adaptive = False
 
     def create_weights(
         self,
@@ -321,13 +322,35 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.server_args import get_global_server_args
+
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
-        self.runner = MoeRunner(backend, moe_runner_config)
+        server_args = get_global_server_args()
+
+        # Check if adaptive MoE is enabled via server args
+        use_adaptive = getattr(server_args, "enable_adaptive_moe", False)
+
+        if use_adaptive:
+            # Create both runners for adaptive selection
+            self.use_adaptive = True
+            self.batch_size_threshold = getattr(
+                server_args, "adaptive_moe_batch_threshold", 1536
+            )
+            # Create triton_kernels runner for large batches
+            self.runner_triton_kernels = MoeRunner(
+                MoeRunnerBackend.TRITON_KERNELS, moe_runner_config
+            )
+            # Create triton runner for small batches
+            self.runner_triton = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+            # Set default runner (will be overridden based on batch size)
+            self.runner = self.runner_triton
+        else:
+            backend = (
+                MoeRunnerBackend.TRITON_KERNELS
+                if self.use_triton_kernels
+                else MoeRunnerBackend.TRITON
+            )
+            self.runner = MoeRunner(backend, moe_runner_config)
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -356,7 +379,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         moe_runner_config = self.moe_runner_config
 
-        backend = self.runner.runner_backend
+        # Adaptive MoE: select runner based on batch size
+        if self.use_adaptive:
+            batch_size = x.shape[0]
+            if batch_size >= self.batch_size_threshold:
+                # Use triton_kernels for large batches
+                runner = self.runner_triton_kernels
+            else:
+                # Use triton for small batches
+                runner = self.runner_triton
+        else:
+            runner = self.runner
+
+        backend = runner.runner_backend
         if backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
@@ -368,7 +403,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w13_bias=getattr(layer, "w13_weight_bias", None),
                 w2_bias=getattr(layer, "w2_weight_bias", None),
             )
-            return self.runner.run(dispatch_output, quant_info)
+            return runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
             output = flashinfer_cutlass_fused_moe(
                 input=x,
@@ -425,7 +460,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                     b13=getattr(layer, "w13_weight_bias", None),
                     b2=getattr(layer, "w2_weight_bias", None),
                 )
-                return self.runner.run(dispatch_output, quant_info)
+                return runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
         self,
