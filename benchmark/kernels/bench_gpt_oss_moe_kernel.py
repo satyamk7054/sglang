@@ -81,11 +81,14 @@ def benchmark_moe_layer(
     config: dict,
     format_name: str,
     num_iters: int = 100,
+    use_fp8: bool = False,
+    w1_scale: torch.Tensor = None,
+    w2_scale: torch.Tensor = None,
 ) -> dict:
     """Benchmark single MoE layer with given weights."""
-    from sglang.srt.layers.moe.fused_moe_triton import fused_moe
+    from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKConfig
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
 
     runner_config = MoeRunnerConfig(
         is_gated=True,
@@ -93,9 +96,19 @@ def benchmark_moe_layer(
         apply_router_weight_on_input=False,
     )
 
-    topk_config = TopKConfig(
-        top_k=config["num_experts_per_tok"],
-        renormalize=True,
+    # Create mock router logits (not used in computation, just for API compatibility)
+    router_logits = torch.zeros(
+        hidden_states.shape[0],
+        config["num_experts"],
+        device="cuda",
+        dtype=torch.float32,
+    )
+
+    # Create StandardTopKOutput object
+    topk_output = StandardTopKOutput(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        router_logits=router_logits,
     )
 
     # Warmup
@@ -104,10 +117,11 @@ def benchmark_moe_layer(
             hidden_states,
             w1,
             w2,
-            topk_weights,
-            topk_ids,
+            topk_output,
             runner_config,
-            topk_config,
+            use_fp8_w8a8=use_fp8,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
         )
         torch.cuda.synchronize()
 
@@ -120,10 +134,11 @@ def benchmark_moe_layer(
             hidden_states,
             w1,
             w2,
-            topk_weights,
-            topk_ids,
+            topk_output,
             runner_config,
-            topk_config,
+            use_fp8_w8a8=use_fp8,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
         )
 
     torch.cuda.synchronize()
@@ -168,7 +183,7 @@ def quantize_to_fp8(w1, w2):
     print(f"  W1: {w1.dtype} → {w1_fp8.dtype}, scale shape: {w1_scale.shape}")
     print(f"  W2: {w2.dtype} → {w2_fp8.dtype}, scale shape: {w2_scale.shape}")
 
-    return w1_fp8, w2_fp8
+    return w1_fp8, w2_fp8, w1_scale, w2_scale
 
 
 def main():
@@ -203,6 +218,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Initialize global server args (required by SGLang MoE kernels)
+    from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+    server_args = ServerArgs(model_path=args.model)
+    set_global_server_args_for_scheduler(server_args)
 
     print("=" * 80)
     print("GPT-OSS MoE Kernel Benchmark: FP8 vs MXFP4")
@@ -274,7 +295,7 @@ def main():
 
             elif fmt == "fp8":
                 # FP8 quantization
-                w1_fp8, w2_fp8 = quantize_to_fp8(w1_bf16, w2_bf16)
+                w1_fp8, w2_fp8, w1_scale, w2_scale = quantize_to_fp8(w1_bf16, w2_bf16)
                 result = benchmark_moe_layer(
                     hidden_states,
                     w1_fp8,
@@ -284,6 +305,9 @@ def main():
                     config,
                     "FP8",
                     args.num_iters,
+                    use_fp8=True,
+                    w1_scale=w1_scale,
+                    w2_scale=w2_scale,
                 )
 
             elif fmt == "mxfp4":
