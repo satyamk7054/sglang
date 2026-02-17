@@ -9,6 +9,14 @@ It supports two kernels:
 1. fused_moe: Standard SGLang MoE kernel (supports FP8, BF16)
 2. matmul_ogs: Specialized triton_kernels kernel optimized for GPT-OSS MXFP4
 
+IMPORTANT NOTES:
+- Memory calculation: For MXFP4, triton_kernels wraps tensors in custom types
+  that don't have standard element_size() methods. We track original tensor
+  properties (numel, element_size) before wrapping to ensure accurate memory
+  calculations. MXFP4 uses 4 bits (0.5 bytes) per element.
+- BF16 baseline: When using matmul_ogs with BF16, the kernel receives unwrapped
+  bf16 tensors. This may not represent optimal performance for this kernel.
+
 Usage:
     # Test both kernels with MXFP4 and FP8
     python benchmark/kernels/bench_gpt_oss_moe_kernel.py \
@@ -465,6 +473,11 @@ def benchmark_moe_matmul_ogs(
     num_iters: int = 100,
     w1_scale: torch.Tensor = None,
     w2_scale: torch.Tensor = None,
+    original_w1_dtype: str = None,
+    original_w1_numel: int = None,
+    original_w1_element_size: int = None,
+    original_w2_numel: int = None,
+    original_w2_element_size: int = None,
 ) -> dict:
     """Benchmark MoE using matmul_ogs kernel (specialized for GPT-OSS MXFP4)."""
     try:
@@ -757,6 +770,11 @@ def main():
                             config,
                             f"BF16 ({kernel_name})",
                             args.num_iters,
+                            original_w1_dtype=str(w1_bf16.dtype),
+                            original_w1_numel=w1_bf16.numel(),
+                            original_w1_element_size=w1_bf16.element_size(),
+                            original_w2_numel=w2_bf16.numel(),
+                            original_w2_element_size=w2_bf16.element_size(),
                         )
 
                     results.append(result)
@@ -799,6 +817,11 @@ def main():
                             args.num_iters,
                             w1_scale=w1_scale,
                             w2_scale=w2_scale,
+                            original_w1_dtype=str(w1_fp8.dtype),
+                            original_w1_numel=w1_fp8.numel(),
+                            original_w1_element_size=w1_fp8.element_size(),
+                            original_w2_numel=w2_fp8.numel(),
+                            original_w2_element_size=w2_fp8.element_size(),
                         )
 
                     results.append(result)
@@ -852,6 +875,19 @@ def main():
                             continue
 
                         try:
+                            # Calculate memory before swizzling (MXFP4 is ~0.5 bytes per element)
+                            # Original tensors: w1=[E, K, N], w2=[E, K, N]
+                            # MXFP4 uses 4 bits = 0.5 bytes per element
+                            w1_numel = (
+                                w1_mxfp4.numel()
+                                if hasattr(w1_mxfp4, "numel")
+                                else w1_bf16.numel()
+                            )
+                            w2_numel = (
+                                w2_mxfp4.numel()
+                                if hasattr(w2_mxfp4, "numel")
+                                else w2_bf16.numel()
+                            )
 
                             result = benchmark_moe_matmul_ogs(
                                 hidden_states,
@@ -864,6 +900,11 @@ def main():
                                 args.num_iters,
                                 w1_scale=w1_scale,
                                 w2_scale=w2_scale,
+                                original_w1_dtype="FloatType(bitwidth_exponent=2, bitwidth_mantissa=1, is_signed=True)",
+                                original_w1_numel=w1_numel,
+                                original_w1_element_size=0.5,  # FP4 = 0.5 bytes
+                                original_w2_numel=w2_numel,
+                                original_w2_element_size=0.5,  # FP4 = 0.5 bytes
                             )
                             results.append(result)
 
