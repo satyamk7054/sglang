@@ -304,6 +304,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
+        self.use_adaptive = False
 
     def create_weights(
         self,
@@ -727,13 +728,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.server_args import get_global_server_args
+
         self.moe_runner_config = moe_runner_config
-        backend = (
-            MoeRunnerBackend.TRITON_KERNELS
-            if self.use_triton_kernels
-            else MoeRunnerBackend.TRITON
-        )
-        self.runner = MoeRunner(backend, moe_runner_config)
+        server_args = get_global_server_args()
+
+        # Check if adaptive MoE is enabled via server args
+        use_adaptive = getattr(server_args, "enable_adaptive_moe", False)
+
+        if use_adaptive:
+            # Create both runners for adaptive selection
+            self.use_adaptive = True
+            self.batch_size_threshold = getattr(
+                server_args, "adaptive_moe_batch_threshold", 1536
+            )
+            # Create triton_kernels runner for large batches
+            self.runner_triton_kernels = MoeRunner(
+                MoeRunnerBackend.TRITON_KERNELS, moe_runner_config
+            )
+            # Create triton runner for small batches
+            self.runner_triton = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+            # Set default runner (will be overridden based on batch size)
+            self.runner = self.runner_triton
+        else:
+            backend = (
+                MoeRunnerBackend.TRITON_KERNELS
+                if self.use_triton_kernels
+                else MoeRunnerBackend.TRITON
+            )
+            self.runner = MoeRunner(backend, moe_runner_config)
 
     def apply(
         self,
@@ -890,6 +913,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
             )
+
+        # Adaptive kernel selection based on batch size
+        if self.use_adaptive:
+            batch_size = dispatch_output.hidden_states.shape[0]
+            runner = (
+                self.runner_triton_kernels
+                if batch_size >= self.batch_size_threshold
+                else self.runner_triton
+            )
+            return runner.run(dispatch_output, quant_info)
+
         return self.runner.run(dispatch_output, quant_info)
 
 
@@ -991,6 +1025,7 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        self.use_adaptive = False
 
     def apply(
         self,
