@@ -279,15 +279,34 @@ class TopK(MultiPlatformOp):
     ) -> TopKOutput:
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
-        elif get_moe_runner_backend().is_triton_kernels():
-            output_format = TopKOutputFormat.TRITON_KERNEL
-        elif (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_mxfp4()
-        ):
-            output_format = TopKOutputFormat.BYPASSED
         else:
-            output_format = TopKOutputFormat.STANDARD
+            # Check if adaptive MoE is enabled - choose format based on batch size
+            from sglang.srt.server_args import get_global_server_args
+
+            server_args = get_global_server_args()
+            use_adaptive = getattr(server_args, "enable_adaptive_moe", False)
+
+            if use_adaptive:
+                # Dynamically choose format based on batch size
+                batch_size = hidden_states.shape[0]
+                batch_threshold = getattr(
+                    server_args, "adaptive_moe_batch_threshold", 1536
+                )
+                # Large batches use triton_kernels format, small batches use standard format
+                output_format = (
+                    TopKOutputFormat.TRITON_KERNEL
+                    if batch_size >= batch_threshold
+                    else TopKOutputFormat.STANDARD
+                )
+            elif get_moe_runner_backend().is_triton_kernels():
+                output_format = TopKOutputFormat.TRITON_KERNEL
+            elif (
+                get_moe_runner_backend().is_flashinfer_trtllm()
+                or get_moe_runner_backend().is_flashinfer_mxfp4()
+            ):
+                output_format = TopKOutputFormat.BYPASSED
+            else:
+                output_format = TopKOutputFormat.STANDARD
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
             # renormalize=True is equivalent to sm_first=False

@@ -672,8 +672,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             return
 
-        if self.use_triton_kernels:
+        # Check if we need both weight formats for adaptive MoE
+        from sglang.srt.server_args import get_global_server_args
 
+        server_args = get_global_server_args()
+        use_adaptive = getattr(server_args, "enable_adaptive_moe", False)
+
+        if self.use_triton_kernels or use_adaptive:
+            # Process weights for triton_kernels backend
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
@@ -700,9 +706,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             self.w13_weight_triton_tensor = w13_weight
             self.w2_weight_triton_tensor = w2_weight
-            del layer.w13_weight
-            del layer.w2_weight
-        else:
+
+        if not self.use_triton_kernels or use_adaptive:
+            # Process weights for triton backend
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
             w13_weight = upcast_from_mxfp(
@@ -717,12 +723,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 target_dtype=torch.bfloat16,
                 axis=-1,
             )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
-            layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+
+            # Store triton backend weights
+            if use_adaptive:
+                # In adaptive mode, keep both formats - store triton weights separately
+                self.w13_weight_triton = Parameter(w13_weight.data, requires_grad=False)
+                self.w2_weight_triton = Parameter(w2_weight.data, requires_grad=False)
+            else:
+                # Non-adaptive mode - just replace layer weights
+                del layer.w13_weight
+                del layer.w2_weight
+                del layer.w13_weight_scale
+                del layer.w2_weight_scale
+                layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
+                layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
+
         torch.cuda.empty_cache()
 
     def create_moe_runner(
@@ -914,8 +929,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 return self.runner_triton_kernels.run(dispatch_output, quant_info)
             else:
                 quant_info = TritonMoeQuantInfo(
-                    w13_weight=layer.w13_weight,
-                    w2_weight=layer.w2_weight,
+                    w13_weight=self.w13_weight_triton,
+                    w2_weight=self.w2_weight_triton,
                     b13=getattr(layer, "w13_weight_bias", None),
                     b2=getattr(layer, "w2_weight_bias", None),
                 )
