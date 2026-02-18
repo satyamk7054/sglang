@@ -735,6 +735,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         # Check if adaptive MoE is enabled via server args
         use_adaptive = getattr(server_args, "enable_adaptive_moe", False)
+        print(f"Using adaptive MoE: {use_adaptive}")
 
         if use_adaptive:
             # Create both runners for adaptive selection
@@ -881,6 +882,45 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
+        # Adaptive kernel selection based on batch size
+        if self.use_adaptive:
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
+            batch_size = dispatch_output.hidden_states.shape[0]
+            use_triton_kernels = batch_size >= self.batch_size_threshold
+
+            if use_triton_kernels:
+                assert (
+                    layer.moe_ep_size == 1
+                ), "Expert parallel is not supported when using triton kernels"
+                quant_info = TritonKernelsQuantInfo(
+                    w13_weight=(
+                        self.w13_weight_triton_tensor
+                        if self.w13_weight_triton_tensor is not None
+                        else layer.w13_weight
+                    ),
+                    w2_weight=(
+                        self.w2_weight_triton_tensor
+                        if self.w2_weight_triton_tensor is not None
+                        else layer.w2_weight
+                    ),
+                    w13_bias=getattr(layer, "w13_weight_bias", None),
+                    w2_bias=getattr(layer, "w2_weight_bias", None),
+                    w13_precision_config=getattr(self, "w13_precision_config", None),
+                    w2_precision_config=getattr(self, "w2_precision_config", None),
+                )
+                return self.runner_triton_kernels.run(dispatch_output, quant_info)
+            else:
+                quant_info = TritonMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    b13=getattr(layer, "w13_weight_bias", None),
+                    b2=getattr(layer, "w2_weight_bias", None),
+                )
+                return self.runner_triton.run(dispatch_output, quant_info)
+
         backend = self.runner.runner_backend
         if backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
@@ -913,16 +953,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 b13=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
             )
-
-        # Adaptive kernel selection based on batch size
-        if self.use_adaptive:
-            batch_size = dispatch_output.hidden_states.shape[0]
-            runner = (
-                self.runner_triton_kernels
-                if batch_size >= self.batch_size_threshold
-                else self.runner_triton
-            )
-            return runner.run(dispatch_output, quant_info)
 
         return self.runner.run(dispatch_output, quant_info)
 

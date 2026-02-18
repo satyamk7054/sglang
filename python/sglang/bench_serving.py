@@ -1617,8 +1617,8 @@ def sample_random_requests(
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
-                    prompt_len=input_lens[i],
-                    output_len=output_lens[i],
+                    prompt_len=int(input_lens[i]),
+                    output_len=int(output_lens[i]),
                 )
             )
     else:
@@ -1636,8 +1636,8 @@ def sample_random_requests(
             input_requests.append(
                 DatasetRow(
                     prompt=input_content,
-                    prompt_len=input_lens[i],
-                    output_len=output_lens[i],
+                    prompt_len=int(input_lens[i]),
+                    output_len=int(output_lens[i]),
                 )
             )
 
