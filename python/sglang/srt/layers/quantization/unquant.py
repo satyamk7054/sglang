@@ -164,7 +164,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self._cache_permute_indices = dict({})
-        self.use_adaptive = False
 
     def create_weights(
         self,
@@ -329,10 +328,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Check if adaptive MoE is enabled via server args
         use_adaptive = getattr(server_args, "enable_adaptive_moe", False)
+        print(f"Using adaptive MoE runner: {use_adaptive}")
 
         if use_adaptive:
             # Create both runners for adaptive selection
-            self.use_adaptive = True
             self.batch_size_threshold = getattr(
                 server_args, "adaptive_moe_batch_threshold", 1536
             )
