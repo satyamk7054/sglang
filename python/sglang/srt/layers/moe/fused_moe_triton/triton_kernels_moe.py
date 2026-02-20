@@ -105,7 +105,9 @@ def triton_kernel_fused_experts(
     assert block_shape is None, "block_shape is not supported"
 
     # type check
-    assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
+    assert (
+        hidden_states.dtype == torch.bfloat16
+    ), f"hidden_states must be bfloat16 but found: {hidden_states.dtype}"
     assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
     assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
 

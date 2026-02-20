@@ -142,6 +142,10 @@ def get_model_config(
             # Use bfloat16 for MXFP4 triton kernels (matches server_args behavior)
             dtype = torch.bfloat16
 
+    if architecture in ["GptOssForCausalLM"]:
+        if dtype in [torch.float16, torch.float32]:
+            dtype = torch.bfloat16
+
     return {
         "num_experts": E,
         "topk": topk,

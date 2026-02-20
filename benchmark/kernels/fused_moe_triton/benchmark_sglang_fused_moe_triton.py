@@ -1,4 +1,4 @@
-# python benchmark/kernels/fused_moe_triton/benchmark_sglang_fused_moe_triton.py --model /shared/public/elr-models/openai/gpt-oss-120b-new/ --tp-size 4
+# python benchmark/kernels/fused_moe_triton/benchmark_sglang_fused_moe_triton.py --model /shared/public/sharing/fc/model_training/ff18c6f156cae4101a1b/checkpoint-100 --tp-size 4
 # python3 benchmark/kernels/fused_moe_triton/sglang_fused_moe_triton.py --model /DeepSeek-V3/ --tp-size 8
 import argparse
 
