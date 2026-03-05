@@ -451,7 +451,12 @@ class FusedMoE(torch.nn.Module):
                     )
                 ):
                     # do not transpose for bias
-                    loaded_weight = loaded_weight.transpose(-2, -1)
+                    # Some model loaders (e.g. GPT-OSS fused mapping) already
+                    # pass transposed weights. Only transpose when needed for
+                    # valid TP sharding on the selected shard dim.
+                    start_idx = shard_size * tp_rank
+                    if start_idx + shard_size > loaded_weight.size(shard_dim):
+                        loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
@@ -523,14 +528,27 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not is_bias and not self.use_presharded_weights:
+                start_idx = shard_size * tp_rank
                 if self.use_triton_kernels and not (
                     self.quant_config is not None
                     and "fp8" in self.quant_config.get_name()
                 ):
-                    loaded_weight = loaded_weight.transpose(-2, -1)
-                loaded_weight = loaded_weight.narrow(
-                    shard_dim, shard_size * tp_rank, shard_size
-                )
+                    # Some model loaders (e.g. GPT-OSS fused mapping) already
+                    # pass transposed weights while others do not.
+                    # Try direct sharding first; if it fails, transpose and retry.
+                    try:
+                        loaded_weight = loaded_weight.narrow(
+                            shard_dim, start_idx, shard_size
+                        )
+                    except (RuntimeError, IndexError):
+                        loaded_weight = loaded_weight.transpose(-2, -1)
+                        loaded_weight = loaded_weight.narrow(
+                            shard_dim, start_idx, shard_size
+                        )
+                else:
+                    loaded_weight = loaded_weight.narrow(
+                        shard_dim, start_idx, shard_size
+                    )
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
@@ -944,22 +962,18 @@ class FusedMoE(torch.nn.Module):
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
 
-        if self.use_triton_kernels and shard_id == "w13":
-            is_transposed = (
-                self.quant_config is None or self.quant_config.get_name() != "fp8"
-            )
+        is_fp8_quant = (
+            self.quant_config is not None and "fp8" in self.quant_config.get_name()
+        )
+        if self.use_triton_kernels and shard_id in ("w13", "w2"):
+            # Triton-kernels fused path expects transposed shard orientation for
+            # non-fp8 checkpoint formats. For fp8 we keep non-transposed dims.
+            is_transposed = not is_fp8_quant
         shard_dim = (
             SHARD_ID_TO_SHARDED_DIM[shard_id]
             if not is_transposed
             else SHARD_ID_TO_SHARDED_DIM_TRANSPOSE[shard_id]
         )
-        if (
-            self.use_triton_kernels
-            and shard_id == "w13"
-            and self.quant_config is not None
-            and "fp8" in self.quant_config.get_name()
-        ):
-            shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
 
         # Case model weights
         if "weight" in weight_name:

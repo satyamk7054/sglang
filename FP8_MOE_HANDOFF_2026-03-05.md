@@ -133,12 +133,47 @@ python -m sglang.launch_server ... 2>&1 | tee /tmp/gpt-oss-fp8-tp4.log
 
 ---
 
+## Postscript: non-fp8 regression + fix (same day)
+
+### Symptom
+- Non-fp8 launch command started failing after FP8 loader changes:
+  - `TIKTOKEN_RS_CACHE_DIR=/shared/public/sharing/inseek/gpt-oss-vocab python -m sglang.launch_server --model-path /shared/public/elr-models/openai/gpt-oss-120b-bf16/ --tp 4 --host 127.0.0.1 --port 30000`
+- Error signature (weight load phase):
+  - `_load_w2 ... IndexError: start out of range ... got 5760`
+  - followed by `w13` size mismatch in later attempts.
+
+### Root cause
+- GPT-OSS fused expert loading path already pre-transposes expert weights.
+- Fused MoE triton-kernel loader also had transpose/orientation logic, creating layout conflicts for non-fp8 route.
+- Result: shard dim selection and narrowing were applied against wrong orientation (especially `w2`, then `w13`).
+
+### Fixes applied
+1. `python/sglang/srt/models/gpt_oss.py`
+- In `_load_normal_weights`, for fused expert weights:
+  - skip pre-transpose when backend is `triton_kernel` and `quantization is None` (non-fp8 route), so downstream loader receives canonical orientation.
+
+2. `python/sglang/srt/layers/moe/fused_moe_triton/layer.py`
+- Hardened triton-kernel sharding/transpose behavior:
+  - robust fallback around narrow/transposed layout in `_load_w2` for non-fp8.
+  - shard-dim orientation logic updated for triton-kernel fused loader (`w13`, `w2`) with fp8/non-fp8 split.
+
+### Validation result
+- Relaunched exact non-fp8 command above.
+- Server passed the previous weight-load crash point.
+- Health check and `/v1/completions` succeeded in the fixed run.
+
+### Note
+- Frequent `exit code 137` entries in terminal history include both real worker crashes during debugging and intentional stops during iterative relaunch; use traceback presence to distinguish.
+
+---
+
 ## Current modified files snapshot
 ```text
 M python/sglang/srt/layers/moe/fused_moe_triton/layer.py
 M python/sglang/srt/layers/moe/fused_moe_triton/triton_kernels_moe.py
 M python/sglang/srt/layers/moe/moe_runner/triton_kernels.py
 M python/sglang/srt/layers/quantization/fp8.py
+M python/sglang/srt/models/gpt_oss.py
 M python/sglang/srt/server_args.py
 M test/manual/layers/moe/test_moe_runners_1gpu.py
 ```

@@ -58,7 +58,10 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
+from sglang.srt.layers.moe.utils import (
+    filter_moe_weight_param_global_expert,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -1069,7 +1072,13 @@ class GptOssForCausalLM(nn.Module):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    if "bias" not in name:
+                    server_args = get_global_server_args()
+                    skip_fused_weight_pretranspose = (
+                        server_args is not None
+                        and get_moe_runner_backend().is_triton_kernels()
+                        and server_args.quantization is None
+                    )
+                    if "bias" not in name and not skip_fused_weight_pretranspose:
                         loaded_weight = loaded_weight.transpose(-2, -1)
                     if "w2_weight_bias" in name and get_moe_tensor_parallel_rank() != 0:
                         loaded_weight = loaded_weight.zero_()
