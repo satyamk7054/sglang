@@ -27,6 +27,17 @@ def quantize(w, dtype, dev, **opt):
         return w.to(torch.bfloat16), InFlexData()
 
 
+def _get_fp8_dtypes() -> tuple[torch.dtype, ...]:
+    return tuple(
+        dtype
+        for dtype in (
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e4m3fnuz", None),
+        )
+        if dtype is not None
+    )
+
+
 def triton_kernel_moe_forward(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -94,20 +105,30 @@ def triton_kernel_fused_experts(
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
 ) -> torch.Tensor:
-
-    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
     assert per_channel_quant is False, "per_channel_quant is not supported"
     assert expert_map is None, "expert_map is not supported"
-    assert w1_scale is None, "w1_scale is not supported"
-    assert w2_scale is None, "w2_scale is not supported"
-    assert a1_scale is None, "a1_scale is not supported"
-    assert a2_scale is None, "a2_scale is not supported"
     assert block_shape is None, "block_shape is not supported"
+
+    if use_fp8_w8a8:
+        assert w1_scale is not None, "w1_scale is required for use_fp8_w8a8"
+        assert w2_scale is not None, "w2_scale is required for use_fp8_w8a8"
+        assert a1_scale is None, "a1_scale is not supported"
+        assert a2_scale is None, "a2_scale is not supported"
+    else:
+        assert w1_scale is None, "w1_scale is not supported"
+        assert w2_scale is None, "w2_scale is not supported"
+        assert a1_scale is None, "a1_scale is not supported"
+        assert a2_scale is None, "a2_scale is not supported"
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
-    assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
-    assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
+    if use_fp8_w8a8:
+        fp8_dtypes = _get_fp8_dtypes()
+        assert w1.dtype in fp8_dtypes, f"w1 must be fp8, got {w1.dtype}"
+        assert w2.dtype in fp8_dtypes, f"w2 must be fp8, got {w2.dtype}"
+    else:
+        assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
+        assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
@@ -129,6 +150,9 @@ def triton_kernel_fused_experts(
     if global_num_experts == -1:
         global_num_experts = E
 
+    w1_pcg = PrecisionConfig(weight_scale=w1_scale) if use_fp8_w8a8 else None
+    w2_pcg = PrecisionConfig(weight_scale=w2_scale) if use_fp8_w8a8 else None
+
     # consistent with default implementation
     intermediate_cache2 = torch.empty(
         (M * n_expts_act, N // 2), device="cuda", dtype=dtype
@@ -140,6 +164,7 @@ def triton_kernel_fused_experts(
         None,
         routing_data,
         gather_indx=gather_indx,
+        precision_config=w1_pcg,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
     )
 
@@ -156,6 +181,7 @@ def triton_kernel_fused_experts(
         None,
         routing_data,
         scatter_indx=scatter_indx,
+        precision_config=w2_pcg,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
     )
 
@@ -243,21 +269,27 @@ def triton_kernel_fused_experts_with_bias(
     gemm1_alpha: Optional[float] = None,
     gemm1_clamp_limit: Optional[float] = None,
 ) -> torch.Tensor:
-    assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
     assert per_channel_quant is False, "per_channel_quant is not supported"
     assert expert_map is None, "expert_map is not supported"
-    assert w1_scale is None, "w1_scale is not supported"
-    assert w2_scale is None, "w2_scale is not supported"
-    assert a1_scale is None, "a1_scale is not supported"
-    assert a2_scale is None, "a2_scale is not supported"
     assert block_shape is None, "block_shape is not supported"
+
+    if use_fp8_w8a8:
+        assert w1_scale is not None, "w1_scale is required for use_fp8_w8a8"
+        assert w2_scale is not None, "w2_scale is required for use_fp8_w8a8"
+        assert a1_scale is None, "a1_scale is not supported"
+        assert a2_scale is None, "a2_scale is not supported"
+    else:
+        assert w1_scale is None, "w1_scale is not supported"
+        assert w2_scale is None, "w2_scale is not supported"
+        assert a1_scale is None, "a1_scale is not supported"
+        assert a2_scale is None, "a2_scale is not supported"
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
-    for w in (w1, w2):
-        # TODO assert bf16 or mxfp4
-        # assert (w.dtype == torch.bfloat16) or check-is-mxfp4, f"w must be bfloat16 or mxfp4 {w1.dtype=}"
-        pass
+    if use_fp8_w8a8:
+        fp8_dtypes = _get_fp8_dtypes()
+        assert w1.dtype in fp8_dtypes, f"w1 must be fp8, got {w1.dtype}"
+        assert w2.dtype in fp8_dtypes, f"w2 must be fp8, got {w2.dtype}"
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
@@ -277,7 +309,10 @@ def triton_kernel_fused_experts_with_bias(
         global_num_experts = E
 
     # TODO maybe completely remove this branch
-    if w1.dtype == torch.bfloat16:
+    if use_fp8_w8a8:
+        w1_pcg = PrecisionConfig(weight_scale=w1_scale)
+        w2_pcg = PrecisionConfig(weight_scale=w2_scale)
+    elif w1.dtype == torch.bfloat16:
         device = "cuda"
         optg = dict()
         w1, w1_flex = quantize(w1, "bf16", device, **optg)

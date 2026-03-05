@@ -1375,12 +1375,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
+            or moe_runner_backend.is_triton_kernels()
             or moe_runner_backend.is_flashinfer_trtllm()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            raise NotImplementedError(
+                f"Unsupported runner backend for FP8 MoE: {moe_runner_backend}"
+            )
 
     def apply(
         self,
@@ -1549,6 +1551,29 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     if not self.block_quant
                     else None
                 ),
+            )
+        elif self.runner.runner_backend.is_triton_kernels():
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsQuantInfo,
+            )
+
+            assert (
+                layer.moe_ep_size == 1
+            ), "Expert parallel is not supported when using triton kernels"
+            assert (
+                not self.block_quant
+            ), "FP8 block quantization is not supported by triton_kernel MoE runner"
+
+            quant_info = TritonKernelsQuantInfo(
+                w13_weight=layer.w13_weight.transpose(1, 2),
+                w2_weight=layer.w2_weight.transpose(1, 2),
+                w13_bias=getattr(layer, "w13_weight_bias", None),
+                w2_bias=getattr(layer, "w2_weight_bias", None),
+                use_fp8_w8a8=True,
+                w13_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a13_scale=layer.w13_input_scale,
+                a2_scale=layer.w2_input_scale,
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = TritonMoeQuantInfo(

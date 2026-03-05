@@ -442,7 +442,14 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
-                if not is_bias and self.use_triton_kernels:
+                if (
+                    not is_bias
+                    and self.use_triton_kernels
+                    and not (
+                        self.quant_config is not None
+                        and "fp8" in self.quant_config.get_name()
+                    )
+                ):
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
@@ -516,7 +523,10 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not is_bias and not self.use_presharded_weights:
-                if self.use_triton_kernels:
+                if self.use_triton_kernels and not (
+                    self.quant_config is not None
+                    and "fp8" in self.quant_config.get_name()
+                ):
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
@@ -719,7 +729,11 @@ class FusedMoE(torch.nn.Module):
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if self.use_triton_kernels:
+        if (
+            self.use_triton_kernels
+            and shard_id == "w13"
+            and (self.quant_config is None or self.quant_config.get_name() != "fp8")
+        ):
             is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)
@@ -930,13 +944,22 @@ class FusedMoE(torch.nn.Module):
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
 
-        if self.use_triton_kernels:
-            is_transposed = True
+        if self.use_triton_kernels and shard_id == "w13":
+            is_transposed = (
+                self.quant_config is None or self.quant_config.get_name() != "fp8"
+            )
         shard_dim = (
             SHARD_ID_TO_SHARDED_DIM[shard_id]
             if not is_transposed
             else SHARD_ID_TO_SHARDED_DIM_TRANSPOSE[shard_id]
         )
+        if (
+            self.use_triton_kernels
+            and shard_id == "w13"
+            and self.quant_config is not None
+            and "fp8" in self.quant_config.get_name()
+        ):
+            shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
 
         # Case model weights
         if "weight" in weight_name:

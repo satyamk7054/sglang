@@ -68,6 +68,14 @@ class TritonKernelsQuantInfo(MoeQuantInfo):
     w2_bias: Optional[torch.Tensor] = None
     w13_precision_config: Optional[PrecisionConfig] = None
     w2_precision_config: Optional[PrecisionConfig] = None
+    use_fp8_w8a8: bool = False
+    per_channel_quant: bool = False
+    expert_map: Optional[torch.Tensor] = None
+    w13_scale: Optional[torch.Tensor] = None
+    w2_scale: Optional[torch.Tensor] = None
+    a13_scale: Optional[torch.Tensor] = None
+    a2_scale: Optional[torch.Tensor] = None
+    block_shape: Optional[list[int]] = None
     global_num_experts: int = -1
 
 
@@ -103,7 +111,15 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
             inplace=False,
             activation=self.config.activation,
             apply_router_weight_on_input=self.config.apply_router_weight_on_input,
+            use_fp8_w8a8=quant_info.use_fp8_w8a8,
+            per_channel_quant=quant_info.per_channel_quant,
             global_num_experts=quant_info.global_num_experts,
+            expert_map=quant_info.expert_map,
+            w1_scale=quant_info.w13_scale,
+            w2_scale=quant_info.w2_scale,
+            a1_scale=quant_info.a13_scale,
+            a2_scale=quant_info.a2_scale,
+            block_shape=quant_info.block_shape,
         )
 
         has_bias = quant_info.w13_bias is not None or quant_info.w2_bias is not None

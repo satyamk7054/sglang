@@ -1483,25 +1483,35 @@ class ServerArgs:
                 quantization_config is not None
                 and quantization_config.get("quant_method") == "mxfp4"
             )
-            if is_mxfp4_quant_format:
+            if is_mxfp4_quant_format and self.quantization in (None, "mxfp4"):
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
 
             if self.moe_runner_backend == "auto":
-                if is_sm100_supported() and is_mxfp4_quant_format:
+                if (
+                    is_sm100_supported()
+                    and is_mxfp4_quant_format
+                    and self.quantization in (None, "mxfp4")
+                ):
                     self.moe_runner_backend = "flashinfer_mxfp4"
                     logger.warning(
                         "Detected SM100 and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                     )
-                elif is_sm120_supported() and is_mxfp4_quant_format:
+                elif (
+                    is_sm120_supported()
+                    and is_mxfp4_quant_format
+                    and self.quantization in (None, "mxfp4")
+                ):
                     # trtllm-gen only supports SM100
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
                         "Detected SM120 and MXFP4 quantization format for GPT-OSS model, enabling triton_kernel MOE kernel."
                     )
                 elif (
-                    is_hip() and get_bool_env_var("SGLANG_USE_AITER")
-                ) and is_mxfp4_quant_format:
+                    (is_hip() and get_bool_env_var("SGLANG_USE_AITER"))
+                    and is_mxfp4_quant_format
+                    and self.quantization in (None, "mxfp4")
+                ):
                     self.moe_runner_backend = "auto"
                     logger.warning(
                         "Detected ROCm and MXFP4 quantization format for GPT-OSS model, enabling aiter MXFP4 MOE kernel."
@@ -1516,12 +1526,17 @@ class ServerArgs:
                 elif (
                     self.ep_size == 1
                     and is_triton_kernels_available()
-                    and self.quantization is None
+                    and self.quantization in (None, "fp8")
                 ):
                     self.moe_runner_backend = "triton_kernel"
-                    logger.warning(
-                        "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
-                    )
+                    if self.quantization == "fp8":
+                        logger.warning(
+                            "Detected GPT-OSS model with fp8 quantization, enabling triton_kernels MOE kernel."
+                        )
+                    else:
+                        logger.warning(
+                            "Detected GPT-OSS model, enabling triton_kernels MOE kernel."
+                        )
 
             if self.moe_runner_backend == "triton_kernel":
                 assert (

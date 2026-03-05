@@ -61,6 +61,20 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
+        "moe_runner_triton_kernel_fp8": {
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "triton_kernel",
+                "--quantization",
+                "fp8",
+                "--attention-backend",
+                "torch_native",
+                "--sampling-backend",
+                "pytorch",
+            ],
+        },
         "moe_runner_flashinfer_cutlass": {
             "model": DEFAULT_MODEL_NAME_FOR_TEST_MOE_NVFP4,  # requires model with modelopt_fp4 quantization
             "other_args": [
