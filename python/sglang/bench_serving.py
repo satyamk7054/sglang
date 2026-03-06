@@ -47,6 +47,8 @@ from sglang.benchmark.utils import (
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
+_EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
+
 TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) and (
     shutil.which("gnuplot") is not None
 )
@@ -671,6 +673,56 @@ async def async_request_sglang_generate(
     return output
 
 
+async def async_request_openai_embeddings(
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = request_func_input.api_url
+
+    async with _create_bench_client_session() as session:
+        payload = {
+            "input": request_func_input.prompt,
+            "model": request_func_input.model,
+        }
+
+        if request_func_input.lora_name:
+            payload["model"] = request_func_input.lora_name
+            payload["lora_path"] = request_func_input.lora_name
+
+        payload.update(request_func_input.extra_request_body)
+
+        headers = get_request_headers()
+        if request_func_input.routing_key:
+            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+
+        output = RequestFuncOutput.init_new(request_func_input)
+
+        st = time.perf_counter()
+        output.start_time = st
+        try:
+            async with session.post(
+                url=api_url, json=payload, headers=headers
+            ) as response:
+                if response.status == 200:
+                    await response.json()
+                    output.latency = time.perf_counter() - st
+                    output.success = True
+                    output.output_len = 0
+                else:
+                    output.error = (
+                        (response.reason or "") + ": " + (await response.text())
+                    )
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 async def async_request_gserver(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -772,6 +824,7 @@ ASYNC_REQUEST_FUNCS = {
     "sglang-native": async_request_sglang_generate,
     "sglang-oai": async_request_openai_completions,
     "sglang-oai-chat": async_request_openai_chat_completions,
+    "sglang-embedding": async_request_openai_embeddings,
     "vllm": async_request_openai_completions,
     "vllm-chat": async_request_openai_chat_completions,
     "lmdeploy": async_request_openai_completions,
@@ -1365,12 +1418,15 @@ async def benchmark(
                 "Total input vision tokens:", metrics.total_input_vision
             )
         )
-    print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
-    print(
-        "{:<40} {:<10}".format(
-            "Total generated tokens (retokenized):", metrics.total_output_retokenized
+    is_embedding = backend == "sglang-embedding"
+    if not is_embedding:
+        print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+        print(
+            "{:<40} {:<10}".format(
+                "Total generated tokens (retokenized):",
+                metrics.total_output_retokenized,
+            )
         )
-    )
     print(
         "{:<40} {:<10.2f}".format(
             "Request throughput (req/s):", metrics.request_throughput
@@ -1381,26 +1437,29 @@ async def benchmark(
             "Input token throughput (tok/s):", metrics.input_throughput
         )
     )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Output token throughput (tok/s):", metrics.output_throughput
+    if not is_embedding:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Output token throughput (tok/s):", metrics.output_throughput
+            )
         )
-    )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Peak output token throughput (tok/s):", metrics.max_output_tokens_per_s
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Peak output token throughput (tok/s):",
+                metrics.max_output_tokens_per_s,
+            )
         )
-    )
     print(
         "{:<40} {:<10}".format(
             "Peak concurrent requests:", metrics.max_concurrent_requests
         )
     )
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Total token throughput (tok/s):", metrics.total_throughput
+    if not is_embedding:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Total token throughput (tok/s):", metrics.total_throughput
+            )
         )
-    )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
@@ -1419,22 +1478,25 @@ async def benchmark(
     print(
         "{:<40} {:<10.2f}".format("P99 E2E Latency (ms):", metrics.p99_e2e_latency_ms)
     )
-    print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
-    print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
-    print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
-    print(
-        "{s:{c}^{n}}".format(s="Time per Output Token (excl. 1st token)", n=50, c="-")
-    )
-    print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
-    print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
-    print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
-    print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
-    print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
-    print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
-    print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
-    print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+    if not is_embedding:
+        print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
+        print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
+        print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+        print(
+            "{s:{c}^{n}}".format(
+                s="Time per Output Token (excl. 1st token)", n=50, c="-"
+            )
+        )
+        print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
+        print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
+        print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
+        print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
+        print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
+        print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
+        print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
+        print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
+        print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
     resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
@@ -1623,7 +1685,13 @@ def run_benchmark(args_: argparse.Namespace):
         else f"http://{args.host}:{args.port}/v1/models"
     )
 
-    if args.backend in ["sglang", "sglang-native"]:
+    if args.backend == "sglang-embedding":
+        api_url = (
+            f"{args.base_url}/v1/embeddings"
+            if args.base_url
+            else f"http://{args.host}:{args.port}/v1/embeddings"
+        )
+    elif args.backend in ["sglang", "sglang-native"]:
         api_url = (
             f"{args.base_url}/generate"
             if args.base_url
@@ -1685,11 +1753,18 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if not check_chat_template(args.model):
+    if args.backend != "sglang-embedding" and not check_chat_template(args.model):
         print(
             "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
+
+    if (
+        args.backend == "sglang-embedding"
+        and args.dataset_name in _EMBEDDING_UNSUPPORTED_DATASETS
+    ):
+        print(f"{args.dataset_name} dataset is unsupported for embeddings benchmark")
+        sys.exit(1)
 
     if args.dataset_name in ["image", "mmmu"]:
         args.apply_chat_template = True
