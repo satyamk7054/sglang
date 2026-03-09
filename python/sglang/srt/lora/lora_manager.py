@@ -468,6 +468,7 @@ class LoRAManager:
             self.lora_added_tokens_size = inferred_extra_vocab_size
 
         logger.info(f"Inferred LoRA target modules: {sorted(self.target_modules)}")
+        logger.info(f"Inferred max_lora_rank: {self.max_lora_rank}")
 
     def load_lora_weights(self, lora_ref: LoRARef):
         """

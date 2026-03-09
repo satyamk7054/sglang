@@ -99,6 +99,9 @@ def get_lora_configs(
 DEFAULT_SHRINK_CONFIG = {"BLOCK_N": 16, "BLOCK_K": 256, "num_warps": 4, "num_stages": 2}
 DEFAULT_EXPAND_CONFIG = {"BLOCK_N": 64, "BLOCK_K": 16, "num_warps": 4, "num_stages": 2}
 
+# Track which configs have been logged to avoid spamming on every forward pass
+_logged_configs: set = set()
+
 
 def get_lora_shrink_config(
     K: int,
@@ -112,14 +115,31 @@ def get_lora_shrink_config(
         R: max_rank (num_slices * r)
         chunk_size: BLOCK_M value (= batch_info.max_len)
     """
+    log_key = ("shrink", K, R, chunk_size)
     configs = get_lora_configs("shrink", K, R)
     if configs is not None:
-        # Find closest chunk_size
         config = configs.get(chunk_size)
         if config is None:
             closest = min(configs.keys(), key=lambda x: abs(x - chunk_size))
             config = configs[closest]
+            if log_key not in _logged_configs:
+                _logged_configs.add(log_key)
+                logger.info(
+                    f"LoRA shrink (K={K}, R={R}): no config for chunk_size={chunk_size}, "
+                    f"using closest={closest}: {config}"
+                )
+        else:
+            if log_key not in _logged_configs:
+                _logged_configs.add(log_key)
+                logger.info(
+                    f"LoRA shrink (K={K}, R={R}, chunk_size={chunk_size}): tuned config {config}"
+                )
         return config
+    if log_key not in _logged_configs:
+        _logged_configs.add(log_key)
+        logger.info(
+            f"LoRA shrink (K={K}, R={R}): no tuned config, using defaults {DEFAULT_SHRINK_CONFIG}"
+        )
     return dict(DEFAULT_SHRINK_CONFIG)
 
 
@@ -135,11 +155,29 @@ def get_lora_expand_config(
         R: max_rank
         chunk_size: BLOCK_M value (= batch_info.max_len)
     """
+    log_key = ("expand", K, R, chunk_size)
     configs = get_lora_configs("expand", K, R)
     if configs is not None:
         config = configs.get(chunk_size)
         if config is None:
             closest = min(configs.keys(), key=lambda x: abs(x - chunk_size))
             config = configs[closest]
+            if log_key not in _logged_configs:
+                _logged_configs.add(log_key)
+                logger.info(
+                    f"LoRA expand (K={K}, R={R}): no config for chunk_size={chunk_size}, "
+                    f"using closest={closest}: {config}"
+                )
+        else:
+            if log_key not in _logged_configs:
+                _logged_configs.add(log_key)
+                logger.info(
+                    f"LoRA expand (K={K}, R={R}, chunk_size={chunk_size}): tuned config {config}"
+                )
         return config
+    if log_key not in _logged_configs:
+        _logged_configs.add(log_key)
+        logger.info(
+            f"LoRA expand (K={K}, R={R}): no tuned config, using defaults {DEFAULT_EXPAND_CONFIG}"
+        )
     return dict(DEFAULT_EXPAND_CONFIG)
