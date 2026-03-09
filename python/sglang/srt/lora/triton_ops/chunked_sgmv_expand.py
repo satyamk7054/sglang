@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.triton_ops.lora_tuning_config import get_lora_expand_config
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 
@@ -173,10 +174,11 @@ def chunked_sgmv_lora_expand_forward(
     num_slices = len(slice_offsets) - 1
     assert input_dim == num_slices * MAX_RANK
 
-    # TODO (lifuhuang): fine-tune per operation
+    # Block shapes — use auto-tuned config if available, else defaults
     BLOCK_M = batch_info.max_len
-    BLOCK_K = 16
-    BLOCK_N = 64
+    config = get_lora_expand_config(K=OUTPUT_DIM, R=MAX_RANK, chunk_size=BLOCK_M)
+    BLOCK_K = config["BLOCK_K"]
+    BLOCK_N = config["BLOCK_N"]
 
     num_segments = batch_info.num_segments
 

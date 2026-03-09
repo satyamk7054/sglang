@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.triton_ops.lora_tuning_config import get_lora_shrink_config
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 
@@ -137,11 +138,13 @@ def chunked_sgmv_lora_shrink_forward(
     assert len(x.shape) == 2
     assert len(weights.shape) == 3
 
-    # Block shapes
-    # TODO (lifuhuang): experiment with split-k
+    # Block shapes — use auto-tuned config if available, else defaults
     BLOCK_M = batch_info.max_len
-    BLOCK_N = 16
-    BLOCK_K = 256
+    config = get_lora_shrink_config(
+        K=weights.shape[2], R=weights.shape[1], chunk_size=BLOCK_M
+    )
+    BLOCK_N = config["BLOCK_N"]
+    BLOCK_K = config["BLOCK_K"]
 
     S = x.shape[0]
     N = weights.shape[1]
