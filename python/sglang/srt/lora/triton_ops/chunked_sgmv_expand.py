@@ -8,7 +8,13 @@ from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 
 
-@cached_triton_kernel(lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"]))
+@cached_triton_kernel(
+    lambda _, kwargs: (
+        kwargs["NUM_SLICES"],
+        kwargs["BLOCK_M"],
+        kwargs["REORDERED"],
+    )
+)
 @triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_expand_kernel(
     # Pointers to matrices
@@ -32,6 +38,7 @@ def _chunked_lora_expand_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    REORDERED: tl.constexpr,
 ):
     """
     Computes a chunked SGMV for LoRA expand operations.
@@ -39,6 +46,11 @@ def _chunked_lora_expand_kernel(
     When a sequence's rank is 0, the kernel is essentially a no-op, following
     the convention in pytorch where the product of two matrices of shape (m, 0)
     and (0, n) is an all-zero matrix of shape (m, n).
+
+    When REORDERED is True, the input x (intermediate from shrink) is in logical
+    (permuted) order — contiguous by adapter group. Reads use logical indices for
+    sequential access. Writes to the output (base_output) still use physical indices
+    via the permutation, since base_output is in the original token order.
 
     Args:
         x (Tensor): The input tensor, which is the result of the LoRA A projection.
@@ -86,11 +98,22 @@ def _chunked_lora_expand_kernel(
     # Adjust K (rank) according to the specific LoRA adapter
     cur_rank = tl.minimum(MAX_RANK, cur_rank)
 
-    # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
-    s_offset_physical = tl.load(
-        permutation + s_offset_logical, mask=s_offset_logical < seg_end
-    )
+
+    if REORDERED:
+        # Input x is in logical order (from reordered shrink output): read contiguously
+        s_offset_read = s_offset_logical
+        # Output is in physical (original) order: need permutation for writes
+        s_offset_write = tl.load(
+            permutation + s_offset_logical, mask=s_offset_logical < seg_end
+        )
+    else:
+        # Both read and write at physical indices via permutation
+        s_offset_physical = tl.load(
+            permutation + s_offset_logical, mask=s_offset_logical < seg_end
+        )
+        s_offset_read = s_offset_physical
+        s_offset_write = s_offset_physical
 
     # Create pointers for the first block of x and weights[batch_id][n_start: n_end][:]
     # The pointers will be advanced as we move in the K direction
@@ -102,7 +125,7 @@ def _chunked_lora_expand_kernel(
     x_ptrs = (
         x
         + slice_id * cur_rank * x_stride_1
-        + (s_offset_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
+        + (s_offset_read[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
     )
     w_ptrs = (weights + w_index * w_stride_0) + (
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
@@ -132,8 +155,7 @@ def _chunked_lora_expand_kernel(
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = output + (
-        s_offset_physical[:, None] * output_stride_0
-        + n_offset[None, :] * output_stride_1
+        s_offset_write[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
     output_mask = (s_offset_logical[:, None] < seg_end) & (
         n_offset[None, :] < slice_end
@@ -178,6 +200,10 @@ def chunked_sgmv_lora_expand_forward(
     BLOCK_K = 16
     BLOCK_N = 64
 
+    # Check if the intermediate from shrink is in logical order.
+    # If so, reads are contiguous but writes still need permutation.
+    reordered = batch_info.reordered_intermediate
+
     num_segments = batch_info.num_segments
 
     grid = (
@@ -209,6 +235,7 @@ def chunked_sgmv_lora_expand_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        REORDERED=reordered,
     )
 
     return output

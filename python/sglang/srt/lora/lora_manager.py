@@ -467,6 +467,8 @@ class LoRAManager:
                 )
             self.lora_added_tokens_size = inferred_extra_vocab_size
 
+        logger.info(f"Inferred LoRA target modules: {sorted(self.target_modules)}")
+
     def load_lora_weights(self, lora_ref: LoRARef):
         """
         Load the weights of a LoRA adapter to CPU memory and conducts post-loading validation.

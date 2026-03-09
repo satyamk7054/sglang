@@ -40,6 +40,11 @@ class LoRABatchInfo:
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
     permutation: Optional[torch.Tensor]
 
+    # Whether the shrink output (intermediate) is in logical (permuted) order.
+    # Set by chunked_sgmv_lora_shrink_forward when it pre-reorders the input.
+    # The expand kernel checks this to read the intermediate contiguously.
+    reordered_intermediate: bool = False
+
 
 class LoRAType(Enum):
     LORA_A = 0
