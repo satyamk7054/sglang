@@ -271,6 +271,3 @@ sgl-kernel/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
-
-*_CONTEXT.md
-*CONTEXT.md

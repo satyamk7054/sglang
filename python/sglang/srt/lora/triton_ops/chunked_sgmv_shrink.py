@@ -7,12 +7,7 @@ from sglang.srt.utils import cached_triton_kernel
 
 
 @cached_triton_kernel(
-    lambda _, kwargs: (
-        kwargs["K"],
-        kwargs["NUM_SLICES"],
-        kwargs["BLOCK_M"],
-        kwargs["REORDERED"],
-    )
+    lambda _, kwargs: (kwargs["K"], kwargs["NUM_SLICES"], kwargs["BLOCK_M"])
 )
 @triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_shrink_kernel(
@@ -33,7 +28,6 @@ def _chunked_lora_shrink_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    REORDERED: tl.constexpr,
 ):
     """
     Computes a chunked SGMV for LoRA shrink operations.
@@ -42,11 +36,6 @@ def _chunked_lora_shrink_kernel(
     stores the product of the input `x` and the LoRA weights for the corresponding
     sequence. This implies that when rank is 0, the kernel is essentially a no-op,
     as output[seg_start:seg_start + seg_len, :0] is trivially correct (empty).
-
-    When REORDERED is True, x has been pre-reordered by the permutation so that
-    tokens are contiguous by adapter group. Both reads and writes use logical
-    (segment-local) indices for sequential memory access. The output is also in
-    logical (permuted) order.
 
     Args:
         x (torch.Tensor): The input activations tensor of shape `(s, K)`, where `s`
@@ -86,20 +75,17 @@ def _chunked_lora_shrink_kernel(
     # Adjust N dim according to the specific LoRA adapter
     cur_n = tl.minimum(N, rank * NUM_SLICES)
 
+    # Map logical sequence index to physical index
     s_offset_logical = tl.arange(0, BLOCK_M) + seg_start
-
-    if REORDERED:
-        # x is pre-reordered: logical indices are contiguous in memory
-        s_offset = s_offset_logical
-    else:
-        # Map logical sequence index to physical index via permutation
-        s_offset = tl.load(
-            permutation + s_offset_logical, mask=s_offset_logical < seg_end
-        )
+    s_offset_physical = tl.load(
+        permutation + s_offset_logical, mask=s_offset_logical < seg_end
+    )
 
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = tl.arange(0, BLOCK_K)
-    x_ptrs = x + (s_offset[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
+    x_ptrs = x + (
+        s_offset_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
+    )
     w_ptrs = (weights + w_index * w_stride_0) + (
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
@@ -126,7 +112,8 @@ def _chunked_lora_shrink_kernel(
     # Store result to output matrix
     partial_sum = partial_sum.to(x.dtype.element_ty)
     output_ptr = output + (
-        s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
+        s_offset_physical[:, None] * output_stride_0
+        + n_offset[None, :] * output_stride_1
     )
     output_mask = (s_offset_logical[:, None] < seg_end) & (n_offset[None, :] < cur_n)
     tl.store(output_ptr, partial_sum, mask=output_mask)
@@ -161,16 +148,6 @@ def chunked_sgmv_lora_shrink_forward(
     K = weights.shape[2]
     assert x.shape[-1] == K
 
-    # When not using CUDA graph, physically reorder x by the permutation so that
-    # tokens are contiguous by adapter group. This converts scattered reads in the
-    # kernel into sequential reads, improving L2/L1 cache hit rates for the large
-    # input tensor (s, input_dim). The output is written in logical (permuted) order;
-    # the downstream expand kernel checks batch_info.reordered_intermediate.
-    reordered = not batch_info.use_cuda_graph
-    if reordered:
-        x = x[batch_info.permutation]
-    batch_info.reordered_intermediate = reordered
-
     num_segments = batch_info.num_segments
     grid = (
         triton.cdiv(N, BLOCK_N),
@@ -194,7 +171,6 @@ def chunked_sgmv_lora_shrink_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
-        REORDERED=reordered,
     )
 
     return output
