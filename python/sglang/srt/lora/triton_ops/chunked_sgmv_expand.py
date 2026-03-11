@@ -193,6 +193,15 @@ def chunked_sgmv_lora_expand_forward(
     else:
         output = base_output
 
+    # Optional launch params from tuned config
+    extra_kwargs = {}
+    if "num_warps" in config:
+        extra_kwargs["num_warps"] = config["num_warps"]
+    if "num_stages" in config:
+        extra_kwargs["num_stages"] = config["num_stages"]
+    if "maxnreg" in config:
+        extra_kwargs["maxnreg"] = config["maxnreg"]
+
     _chunked_lora_expand_kernel[grid](
         x=x,
         weights=weights,
@@ -211,6 +220,7 @@ def chunked_sgmv_lora_expand_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        **extra_kwargs,
     )
 
     return output

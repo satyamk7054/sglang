@@ -71,26 +71,37 @@ def get_lora_configs(
     json_file_name = get_lora_config_file_name(kernel, K, R)
 
     config_dir = os.environ.get(
-        "SGLANG_LORA_CONFIG_DIR",
-        os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs"),
+        "SGLANG_LORA_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))
     )
+    configs_root = os.path.join(config_dir, "csgmv_configs")
 
     triton_version = triton.__version__
     version_dir = f"triton_{triton_version.replace('.', '_')}"
 
     # Try exact triton version first
-    config_file_path = os.path.join(config_dir, version_dir, json_file_name)
+    config_file_path = os.path.join(configs_root, version_dir, json_file_name)
     if os.path.exists(config_file_path):
         with open(config_file_path) as f:
-            logger.info(f"Using LoRA {kernel} kernel config from {config_file_path}.")
+            logger.info(f"Using LoRA {kernel} config from {config_file_path}.")
             return {int(key): val for key, val in json.load(f).items()}
 
-    # Try version-agnostic path
-    config_file_path = os.path.join(config_dir, json_file_name)
-    if os.path.exists(config_file_path):
-        with open(config_file_path) as f:
-            logger.info(f"Using LoRA {kernel} kernel config from {config_file_path}.")
-            return {int(key): val for key, val in json.load(f).items()}
+    # Scan existing version directories as fallback (newest first)
+    if os.path.isdir(configs_root):
+        version_dirs = sorted(
+            (d for d in os.listdir(configs_root) if d.startswith("triton_")),
+            reverse=True,
+        )
+        for vdir in version_dirs:
+            if vdir == version_dir:
+                continue
+            try_path = os.path.join(configs_root, vdir, json_file_name)
+            if os.path.exists(try_path):
+                with open(try_path) as f:
+                    logger.warning(
+                        f"LoRA {kernel} config not found for Triton {triton_version}. "
+                        f"Falling back to {try_path}."
+                    )
+                    return {int(key): val for key, val in json.load(f).items()}
 
     return None
 
@@ -98,6 +109,10 @@ def get_lora_configs(
 # Default block sizes (current hardcoded values)
 DEFAULT_SHRINK_CONFIG = {"BLOCK_N": 16, "BLOCK_K": 256, "num_warps": 4, "num_stages": 2}
 DEFAULT_EXPAND_CONFIG = {"BLOCK_N": 64, "BLOCK_K": 16, "num_warps": 4, "num_stages": 2}
+
+# Aliases used by the tuning script
+_DEFAULT_SHRINK_CONFIG = DEFAULT_SHRINK_CONFIG
+_DEFAULT_EXPAND_CONFIG = DEFAULT_EXPAND_CONFIG
 
 # Track which configs have been logged to avoid spamming on every forward pass
 _logged_configs: set = set()

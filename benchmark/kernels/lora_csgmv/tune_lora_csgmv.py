@@ -1,52 +1,118 @@
-#!/usr/bin/env python3
 """
-Offline auto-tuning script for LoRA CSGMV kernel block sizes.
+Auto-tuning script for LoRA CSGMV kernels (shrink and expand).
 
-Sweeps block size configurations for the shrink (lora_a) and expand (lora_b)
-kernels, benchmarks each on your GPU, and saves the best configs as JSON files
-that the server automatically picks up at startup.
+Sweeps block dimensions, num_warps, num_stages, and maxnreg (expand only)
+to find the best config for each (kernel, K, R, chunk_size) combination.
+Writes results as JSON to the config directory used by lora_tuning_config.py.
 
 Usage:
-    # Tune for a specific model + rank combo:
-    python3 benchmark/kernels/lora_csgmv/tune_lora_csgmv.py \
-        --model Qwen/Qwen3-Embedding-0.6B \
-        --max-lora-rank 64
+    # Tune from model name (auto-derives hidden_size, QKV dims)
+    python benchmark/kernels/lora_csgmv/tune_lora_csgmv.py \
+        --model Qwen/Qwen3-0.6B --rank 64
 
-    # Tune with explicit dimensions (no model download needed):
-    python3 benchmark/kernels/lora_csgmv/tune_lora_csgmv.py \
-        --hidden-size 1024 --intermediate-size 3072 \
-        --max-lora-rank 64
+    # Tune with explicit dimensions
+    python benchmark/kernels/lora_csgmv/tune_lora_csgmv.py \
+        --hidden-size 1024 --rank 64
 
-    # Configs are saved to:
-    #   python/sglang/srt/lora/triton_ops/configs/<triton_version>/
+    # Tune for specific chunk sizes
+    python benchmark/kernels/lora_csgmv/tune_lora_csgmv.py \
+        --model Qwen/Qwen3-0.6B --rank 64 --chunk-sizes 32 64 128
 
-    # Server automatically loads them when using --lora-backend csgmv
+    # Another model
+    python benchmark/kernels/lora_csgmv/tune_lora_csgmv.py \
+        --model meta-llama/Llama-2-7b-hf --rank 32
 """
 
 import argparse
 import json
+import math
 import os
-import time
-from typing import Any, Dict, List
+import statistics
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 import torch
 import triton
 
 from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
-
-# Import the actual kernels we're tuning
 from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
-from sglang.srt.lora.triton_ops.lora_tuning_config import get_lora_config_file_name
-from sglang.srt.utils import get_device_name
+from sglang.srt.lora.triton_ops.lora_tuning_config import (
+    _DEFAULT_EXPAND_CONFIG,
+    _DEFAULT_SHRINK_CONFIG,
+    get_lora_config_file_name,
+)
+from sglang.srt.lora.utils import LoRABatchInfo
 
 
-def get_shrink_configs() -> List[Dict[str, int]]:
-    """Generate candidate block size configurations for the shrink kernel."""
+def _get_raw_kernel(cached_kernel):
+    """Get the underlying triton.jit function, bypassing cached_triton_kernel."""
+    return getattr(cached_kernel, "fn", cached_kernel)
+
+
+def build_batch_info(
+    total_tokens: int,
+    chunk_size: int,
+    rank: int,
+    device: torch.device,
+) -> LoRABatchInfo:
+    """Build a LoRABatchInfo for benchmarking with a single LoRA adapter."""
+    num_segments = math.ceil(total_tokens / chunk_size)
+
+    seg_indptr = []
+    for i in range(num_segments):
+        seg_indptr.append(i * chunk_size)
+    seg_indptr.append(total_tokens)
+    seg_indptr = torch.tensor(seg_indptr, dtype=torch.int32, device=device)
+
+    weight_indices = torch.ones(num_segments, dtype=torch.int32, device=device)
+    lora_ranks = torch.tensor([0, rank], dtype=torch.int32, device=device)
+    scalings = torch.ones(2, dtype=torch.float32, device=device)
+    permutation = torch.arange(total_tokens, dtype=torch.int32, device=device)
+
+    return LoRABatchInfo(
+        use_cuda_graph=False,
+        bs=1,
+        num_segments=num_segments,
+        max_len=chunk_size,
+        seg_indptr=seg_indptr,
+        weight_indices=weight_indices,
+        lora_ranks=lora_ranks,
+        scalings=scalings,
+        seg_lens=None,
+        permutation=permutation,
+    )
+
+
+def timed_cuda_ms(fn, warmup: int = 10, trials: int = 50) -> float:
+    """Time a GPU function using CUDA events. Returns median time in ms."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    times = []
+    for _ in range(trials):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return statistics.median(times)
+
+
+# ---------------------------------------------------------------------------
+# Search spaces
+# ---------------------------------------------------------------------------
+
+
+def get_shrink_search_space() -> List[Dict[str, Any]]:
+    """Generate candidate configs for the shrink kernel."""
     configs = []
     for block_n in [16, 32, 64]:
         for block_k in [64, 128, 256]:
             for num_warps in [4, 8]:
-                for num_stages in [2, 3, 4, 5]:
+                for num_stages in [2, 3, 4]:
                     configs.append(
                         {
                             "BLOCK_N": block_n,
@@ -58,13 +124,14 @@ def get_shrink_configs() -> List[Dict[str, int]]:
     return configs
 
 
-def get_expand_configs() -> List[Dict[str, int]]:
-    """Generate candidate block size configurations for the expand kernel."""
+def get_expand_search_space() -> List[Dict[str, Any]]:
+    """Generate candidate configs for the expand kernel."""
     configs = []
-    for block_n in [32, 64, 128]:
-        for block_k in [16, 32, 64]:
+    for block_n in [32, 64]:
+        for block_k in [16, 32]:
             for num_warps in [4, 8]:
-                for num_stages in [2, 3, 4, 5]:
+                for num_stages in [1, 2, 3]:
+                    # Without maxnreg
                     configs.append(
                         {
                             "BLOCK_N": block_n,
@@ -73,435 +140,569 @@ def get_expand_configs() -> List[Dict[str, int]]:
                             "num_stages": num_stages,
                         }
                     )
+                    # With maxnreg (register capping for occupancy)
+                    for maxnreg in [96, 112, 128, 160]:
+                        configs.append(
+                            {
+                                "BLOCK_N": block_n,
+                                "BLOCK_K": block_k,
+                                "num_warps": num_warps,
+                                "num_stages": num_stages,
+                                "maxnreg": maxnreg,
+                            }
+                        )
     return configs
 
 
-def get_chunk_sizes() -> List[int]:
-    """Chunk sizes (BLOCK_M) to tune for."""
-    return [16, 32, 64, 128]
+# ---------------------------------------------------------------------------
+# Benchmark functions
+# ---------------------------------------------------------------------------
 
 
-def benchmark_shrink(
-    S: int,
-    K: int,
+def benchmark_shrink_config(
+    config: Dict[str, Any],
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    num_slices: int,
     N: int,
-    num_slices: int,
-    chunk_size: int,
-    config: Dict[str, int],
-    num_loras: int = 4,
-    dtype: torch.dtype = torch.float16,
-    num_iters: int = 200,
-    warmup: int = 50,
-) -> float:
-    """Benchmark the shrink kernel with a given config. Returns median time in ms."""
-    device = "cuda"
+    K: int,
+) -> Optional[float]:
+    """Benchmark a single shrink config. Returns median ms or None on failure."""
+    kernel = _get_raw_kernel(_chunked_lora_shrink_kernel)
+    S = x.shape[0]
+    num_segments = batch_info.num_segments
 
-    # Create test data
-    x = torch.randn(S, K, dtype=dtype, device=device)
-    weights = torch.randn(num_loras, N, K, dtype=dtype, device=device)
-    output = torch.empty(S, N, dtype=dtype, device=device)
+    grid = (triton.cdiv(N, config["BLOCK_N"]), num_segments)
+    output = torch.empty((S, N), device=x.device, dtype=x.dtype)
 
-    # Create batch info: evenly distribute S tokens across num_loras adapters
-    num_segments = (S + chunk_size - 1) // chunk_size
-    seg_indptr = (
-        torch.arange(0, num_segments + 1, dtype=torch.int32, device=device) * chunk_size
-    )
-    seg_indptr[-1] = S  # last segment may be shorter
-    weight_indices = (
-        torch.arange(num_segments, dtype=torch.int32, device=device) % num_loras
-    )
-    lora_ranks = torch.full(
-        (num_loras,), N // num_slices, dtype=torch.int32, device=device
-    )
-    permutation = torch.arange(S, dtype=torch.int32, device=device)
+    extra_kwargs = {}
+    if "num_warps" in config:
+        extra_kwargs["num_warps"] = config["num_warps"]
+    if "num_stages" in config:
+        extra_kwargs["num_stages"] = config["num_stages"]
 
-    BLOCK_N = config["BLOCK_N"]
-    BLOCK_K = config["BLOCK_K"]
-
-    grid = (triton.cdiv(N, BLOCK_N), num_segments)
-
-    # Warmup
-    for _ in range(warmup):
-        _chunked_lora_shrink_kernel[grid](
+    try:
+        kernel[grid](
             x=x,
             weights=weights,
             output=output,
-            seg_indptr=seg_indptr,
-            weight_indices=weight_indices,
-            lora_ranks=lora_ranks,
-            permutation=permutation,
+            seg_indptr=batch_info.seg_indptr,
+            weight_indices=batch_info.weight_indices,
+            lora_ranks=batch_info.lora_ranks,
+            permutation=batch_info.permutation,
             num_segs=num_segments,
             N=N,
             K=K,
             NUM_SLICES=num_slices,
-            BLOCK_M=chunk_size,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            num_warps=config.get("num_warps", 4),
-            num_stages=config.get("num_stages", 2),
-        )
-
-    # Benchmark
-    torch.cuda.synchronize()
-    times = []
-    for _ in range(num_iters):
-        start = time.perf_counter()
-        _chunked_lora_shrink_kernel[grid](
-            x=x,
-            weights=weights,
-            output=output,
-            seg_indptr=seg_indptr,
-            weight_indices=weight_indices,
-            lora_ranks=lora_ranks,
-            permutation=permutation,
-            num_segs=num_segments,
-            N=N,
-            K=K,
-            NUM_SLICES=num_slices,
-            BLOCK_M=chunk_size,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            num_warps=config.get("num_warps", 4),
-            num_stages=config.get("num_stages", 2),
+            BLOCK_M=batch_info.max_len,
+            BLOCK_N=config["BLOCK_N"],
+            BLOCK_K=config["BLOCK_K"],
+            **extra_kwargs,
         )
         torch.cuda.synchronize()
-        times.append((time.perf_counter() - start) * 1000)
+    except Exception:
+        return None
 
-    times.sort()
-    return times[len(times) // 2]  # median
+    def run():
+        kernel[grid](
+            x=x,
+            weights=weights,
+            output=output,
+            seg_indptr=batch_info.seg_indptr,
+            weight_indices=batch_info.weight_indices,
+            lora_ranks=batch_info.lora_ranks,
+            permutation=batch_info.permutation,
+            num_segs=num_segments,
+            N=N,
+            K=K,
+            NUM_SLICES=num_slices,
+            BLOCK_M=batch_info.max_len,
+            BLOCK_N=config["BLOCK_N"],
+            BLOCK_K=config["BLOCK_K"],
+            **extra_kwargs,
+        )
+
+    return timed_cuda_ms(run, warmup=10, trials=50)
 
 
-def benchmark_expand(
-    S: int,
-    output_dim: int,
-    max_rank: int,
-    num_slices: int,
-    chunk_size: int,
-    config: Dict[str, int],
+def benchmark_expand_config(
+    config: Dict[str, Any],
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    slice_offsets: torch.Tensor,
     max_slice_size: int,
-    num_loras: int = 4,
-    dtype: torch.dtype = torch.float16,
-    num_iters: int = 200,
-    warmup: int = 50,
-) -> float:
-    """Benchmark the expand kernel with a given config. Returns median time in ms."""
-    device = "cuda"
+    output_dim: int,
+    num_slices: int,
+    max_rank: int,
+) -> Optional[float]:
+    """Benchmark a single expand config. Returns median ms or None on failure."""
+    kernel = _get_raw_kernel(_chunked_lora_expand_kernel)
+    M = x.shape[0]
+    num_segments = batch_info.num_segments
 
-    x = torch.randn(S, num_slices * max_rank, dtype=dtype, device=device)
-    weights = torch.randn(num_loras, output_dim, max_rank, dtype=dtype, device=device)
-    output = torch.zeros(S, output_dim, dtype=dtype, device=device)
-
-    num_segments = (S + chunk_size - 1) // chunk_size
-    seg_indptr = (
-        torch.arange(0, num_segments + 1, dtype=torch.int32, device=device) * chunk_size
+    grid = (
+        triton.cdiv(max_slice_size, config["BLOCK_N"]),
+        num_slices,
+        num_segments,
     )
-    seg_indptr[-1] = S
-    weight_indices = (
-        torch.arange(num_segments, dtype=torch.int32, device=device) % num_loras
-    )
-    lora_ranks = torch.full((num_loras,), max_rank, dtype=torch.int32, device=device)
-    scalings = torch.ones(num_loras, dtype=torch.float32, device=device)
-    permutation = torch.arange(S, dtype=torch.int32, device=device)
+    output = torch.zeros((M, output_dim), device=x.device, dtype=x.dtype)
 
-    # For simple case: slice_offsets = [0, output_dim]
-    # For qkv: [0, q_dim, q_dim+kv_dim, q_dim+2*kv_dim]
-    slice_size = output_dim // num_slices
-    slice_offsets = torch.tensor(
-        [i * slice_size for i in range(num_slices)] + [output_dim],
-        dtype=torch.int32,
-        device=device,
-    )
+    extra_kwargs = {}
+    if "num_warps" in config:
+        extra_kwargs["num_warps"] = config["num_warps"]
+    if "num_stages" in config:
+        extra_kwargs["num_stages"] = config["num_stages"]
+    if "maxnreg" in config:
+        extra_kwargs["maxnreg"] = config["maxnreg"]
 
-    BLOCK_N = config["BLOCK_N"]
-    BLOCK_K = config["BLOCK_K"]
-
-    grid = (triton.cdiv(max_slice_size, BLOCK_N), num_slices, num_segments)
-
-    # Warmup
-    for _ in range(warmup):
-        _chunked_lora_expand_kernel[grid](
+    try:
+        kernel[grid](
             x=x,
             weights=weights,
             output=output,
-            seg_indptr=seg_indptr,
-            weight_indices=weight_indices,
-            lora_ranks=lora_ranks,
-            permutation=permutation,
+            seg_indptr=batch_info.seg_indptr,
+            weight_indices=batch_info.weight_indices,
+            lora_ranks=batch_info.lora_ranks,
+            permutation=batch_info.permutation,
             num_segs=num_segments,
-            scalings=scalings,
+            scalings=batch_info.scalings,
             slice_offsets=slice_offsets,
             NUM_SLICES=num_slices,
             OUTPUT_DIM=output_dim,
             MAX_RANK=max_rank,
-            BLOCK_M=chunk_size,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            num_warps=config.get("num_warps", 4),
-            num_stages=config.get("num_stages", 2),
-        )
-
-    # Benchmark
-    torch.cuda.synchronize()
-    times = []
-    for _ in range(num_iters):
-        output.zero_()
-        start = time.perf_counter()
-        _chunked_lora_expand_kernel[grid](
-            x=x,
-            weights=weights,
-            output=output,
-            seg_indptr=seg_indptr,
-            weight_indices=weight_indices,
-            lora_ranks=lora_ranks,
-            permutation=permutation,
-            num_segs=num_segments,
-            scalings=scalings,
-            slice_offsets=slice_offsets,
-            NUM_SLICES=num_slices,
-            OUTPUT_DIM=output_dim,
-            MAX_RANK=max_rank,
-            BLOCK_M=chunk_size,
-            BLOCK_N=BLOCK_N,
-            BLOCK_K=BLOCK_K,
-            num_warps=config.get("num_warps", 4),
-            num_stages=config.get("num_stages", 2),
+            BLOCK_M=batch_info.max_len,
+            BLOCK_N=config["BLOCK_N"],
+            BLOCK_K=config["BLOCK_K"],
+            **extra_kwargs,
         )
         torch.cuda.synchronize()
-        times.append((time.perf_counter() - start) * 1000)
+    except Exception:
+        return None
 
-    times.sort()
-    return times[len(times) // 2]
+    def run():
+        output.zero_()
+        kernel[grid](
+            x=x,
+            weights=weights,
+            output=output,
+            seg_indptr=batch_info.seg_indptr,
+            weight_indices=batch_info.weight_indices,
+            lora_ranks=batch_info.lora_ranks,
+            permutation=batch_info.permutation,
+            num_segs=num_segments,
+            scalings=batch_info.scalings,
+            slice_offsets=slice_offsets,
+            NUM_SLICES=num_slices,
+            OUTPUT_DIM=output_dim,
+            MAX_RANK=max_rank,
+            BLOCK_M=batch_info.max_len,
+            BLOCK_N=config["BLOCK_N"],
+            BLOCK_K=config["BLOCK_K"],
+            **extra_kwargs,
+        )
 
-
-def get_model_dims(args) -> Dict[str, int]:
-    """Get model dimensions either from args or by loading the config."""
-    if args.hidden_size and args.max_lora_rank:
-        return {
-            "hidden_size": args.hidden_size,
-            "intermediate_size": args.intermediate_size or args.hidden_size * 4,
-            "max_lora_rank": args.max_lora_rank,
-        }
-    elif args.model:
-        from transformers import AutoConfig
-
-        config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
-        return {
-            "hidden_size": config.hidden_size,
-            "intermediate_size": getattr(
-                config, "intermediate_size", config.hidden_size * 4
-            ),
-            "max_lora_rank": args.max_lora_rank,
-        }
-    else:
-        raise ValueError("Provide either --model or --hidden-size + --max-lora-rank")
-
-
-def tune_kernel(
-    kernel_name: str,
-    configs: List[Dict[str, int]],
-    benchmark_fn,
-    benchmark_kwargs: Dict[str, Any],
-    chunk_sizes: List[int],
-) -> Dict[int, Dict[str, Any]]:
-    """Tune a kernel across chunk sizes and config candidates."""
-    best_configs = {}
-
-    for chunk_size in chunk_sizes:
-        print(f"\n  chunk_size={chunk_size}:")
-        best_time = float("inf")
-        best_config = None
-
-        for i, config in enumerate(configs):
-            try:
-                t = benchmark_fn(
-                    chunk_size=chunk_size, config=config, **benchmark_kwargs
-                )
-                if t < best_time:
-                    best_time = t
-                    best_config = config.copy()
-                if (i + 1) % 20 == 0:
-                    print(
-                        f"    tested {i + 1}/{len(configs)} configs, best so far: {best_time:.4f} ms"
-                    )
-            except Exception as e:
-                # Some configs may be invalid (e.g., BLOCK_K > K)
-                continue
-
-        if best_config is not None:
-            best_configs[chunk_size] = best_config
-            print(f"    best: {best_config} -> {best_time:.4f} ms")
-        else:
-            print(f"    no valid config found!")
-
-    return best_configs
+    return timed_cuda_ms(run, warmup=10, trials=50)
 
 
-def save_config(configs: Dict[int, Dict], filename: str, output_dir: str):
-    """Save tuned configs to JSON."""
-    os.makedirs(output_dir, exist_ok=True)
-    filepath = os.path.join(output_dir, filename)
+# ---------------------------------------------------------------------------
+# Config saving
+# ---------------------------------------------------------------------------
+
+
+def save_config(
+    configs: Dict[int, Dict[str, Any]],
+    kernel: str,
+    K: int,
+    R: int,
+) -> str:
+    """Save tuned configs to the standard config directory. Returns filepath."""
+    filename = get_lora_config_file_name(kernel, K, R)
+
+    triton_version = triton.__version__
+    version_dir = f"triton_{triton_version.replace('.', '_')}"
+    config_dir = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)),
+        "..",
+        "..",
+        "..",
+        "python",
+        "sglang",
+        "srt",
+        "lora",
+        "triton_ops",
+        "csgmv_configs",
+        version_dir,
+    )
+    config_dir = os.path.normpath(config_dir)
+    os.makedirs(config_dir, exist_ok=True)
+
+    filepath = os.path.join(config_dir, filename)
     with open(filepath, "w") as f:
         json.dump(configs, f, indent=4)
         f.write("\n")
-    print(f"Saved config to {filepath}")
+    return filepath
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Auto-tune LoRA CSGMV kernel block sizes",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    parser.add_argument(
-        "--model", type=str, help="HuggingFace model name to infer dimensions"
-    )
-    parser.add_argument(
-        "--hidden-size", type=int, help="Model hidden size (alternative to --model)"
-    )
-    parser.add_argument("--intermediate-size", type=int, help="Model intermediate size")
-    parser.add_argument(
-        "--max-lora-rank", type=int, required=True, help="Max LoRA rank"
-    )
-    parser.add_argument(
-        "--num-tokens",
-        type=int,
-        default=4096,
-        help="Number of tokens for benchmarking (default: 4096)",
-    )
-    parser.add_argument(
-        "--num-iters", type=int, default=200, help="Benchmark iterations"
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
-        help="Output directory for config JSON files",
-    )
-    parser.add_argument(
-        "--dtype", type=str, default="float16", choices=["float16", "bfloat16"]
-    )
-    args = parser.parse_args()
+def sort_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Sort config keys for consistent JSON output."""
+    ordered = {}
+    for key in ["BLOCK_N", "BLOCK_K", "num_warps", "num_stages", "maxnreg"]:
+        if key in config:
+            ordered[key] = config[key]
+    return ordered
 
-    dims = get_model_dims(args)
-    hidden_size = dims["hidden_size"]
-    intermediate_size = dims["intermediate_size"]
-    max_rank = dims["max_lora_rank"]
-    S = args.num_tokens
-    dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
 
-    # Default output dir: alongside the kernel code
-    if args.output_dir is None:
-        triton_version = triton.__version__
-        version_dir = f"triton_{triton_version.replace('.', '_')}"
-        args.output_dir = os.path.join(
-            os.path.dirname(os.path.realpath(__file__)),
-            "..",
-            "..",
-            "..",
-            "python",
-            "sglang",
-            "srt",
-            "lora",
-            "triton_ops",
-            "configs",
-            version_dir,
-        )
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-    device_name = get_device_name()
-    print(f"Device: {device_name}")
-    print(f"Triton: {triton.__version__}")
-    print(f"Hidden size: {hidden_size}, Intermediate size: {intermediate_size}")
-    print(f"Max LoRA rank: {max_rank}, Num tokens: {S}, Dtype: {dtype}")
-    print(f"Output dir: {args.output_dir}")
 
-    chunk_sizes = get_chunk_sizes()
+def get_model_dims(args: argparse.Namespace):
+    """Extract all LoRA layer dimensions from model config or CLI args.
 
-    # Collect all unique (kernel, K, R) combos to tune.
-    # For a typical model, the LoRA layers are:
-    #   qkv_proj: shrink(hidden_size, 3*rank), expand(qkv_out_dim, rank) with 3 slices
-    #   o_proj:   shrink(head_dim*num_heads, rank), expand(hidden_size, rank)
-    #   gate_up:  shrink(hidden_size, 2*rank), expand(2*intermediate_size, rank) with 2 slices
-    #   down_proj: shrink(intermediate_size, rank), expand(hidden_size, rank)
-    #
-    # We tune for the unique dimension combos:
-    tune_jobs = []
+    Returns a list of (label, shrink_K, expand_output_dim, num_slices,
+    slice_offsets_list) tuples for each LoRA layer type.
+    """
+    if args.model:
+        from transformers import AutoConfig
 
-    # Shrink: (K=input_dim, N=num_slices*rank)
-    shrink_dims = set()
-    shrink_dims.add((hidden_size, 3 * max_rank, 3))  # qkv
-    shrink_dims.add((hidden_size, max_rank, 1))  # o_proj (input side)
-    shrink_dims.add((hidden_size, 2 * max_rank, 2))  # gate_up
-    shrink_dims.add((intermediate_size, max_rank, 1))  # down_proj
+        config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+        hidden_size = config.hidden_size
 
-    # Expand: (output_dim, rank, num_slices)
-    expand_dims = set()
-    expand_dims.add((hidden_size, max_rank, 1))  # o_proj output, down_proj output
-    expand_dims.add(
-        (intermediate_size, max_rank, 2)
-    )  # gate_up (2 slices, each intermediate_size)
+        num_heads = config.num_attention_heads
+        num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
+        head_dim = getattr(config, "head_dim", hidden_size // num_heads)
+        intermediate_size = config.intermediate_size
 
-    # ---- Tune shrink kernels ----
-    shrink_candidates = get_shrink_configs()
-    for K, N, num_slices in sorted(shrink_dims):
-        print(f"\n{'='*60}")
-        print(f"Tuning SHRINK: K={K}, N={N}, num_slices={num_slices}")
-        print(f"{'='*60}")
+        q_dim = num_heads * head_dim
+        kv_dim = num_kv_heads * head_dim
+        qkv_output_dim = q_dim + 2 * kv_dim
 
-        best = tune_kernel(
-            kernel_name="shrink",
-            configs=shrink_candidates,
-            benchmark_fn=lambda chunk_size, config, **kw: benchmark_shrink(
-                S=S,
-                K=K,
-                N=N,
-                num_slices=num_slices,
-                chunk_size=chunk_size,
-                config=config,
-                dtype=dtype,
-                num_iters=args.num_iters,
-            ),
-            benchmark_kwargs={},
-            chunk_sizes=chunk_sizes,
-        )
-
-        filename = get_lora_config_file_name("shrink", K, N)
-        save_config(best, filename, args.output_dir)
-
-    # ---- Tune expand kernels ----
-    expand_candidates = get_expand_configs()
-    for output_dim, rank, num_slices in sorted(expand_dims):
-        print(f"\n{'='*60}")
+        print(f"Model: {args.model}")
         print(
-            f"Tuning EXPAND: output_dim={output_dim}, rank={rank}, num_slices={num_slices}"
+            f"  hidden_size={hidden_size}, num_heads={num_heads}, "
+            f"num_kv_heads={num_kv_heads}, head_dim={head_dim}"
         )
-        print(f"{'='*60}")
+        print(f"  intermediate_size={intermediate_size}")
+    else:
+        hidden_size = args.hidden_size
+        intermediate_size = getattr(args, "intermediate_size", None) or hidden_size * 3
+        if args.qkv_output_dim:
+            qkv_output_dim = args.qkv_output_dim
+            q_dim = qkv_output_dim // 2
+            kv_dim = (qkv_output_dim - q_dim) // 2
+        else:
+            q_dim = hidden_size * 2
+            kv_dim = hidden_size
+            qkv_output_dim = q_dim + 2 * kv_dim
 
-        max_slice_size = output_dim // num_slices
+    # All LoRA layer types with their dimensions:
+    #   (label, shrink_K, expand_output_dim, num_slices, slice_offsets)
+    layers = [
+        (
+            "qkv",
+            hidden_size,
+            qkv_output_dim,
+            3,
+            [0, q_dim, q_dim + kv_dim, qkv_output_dim],
+        ),
+        ("o_proj", q_dim, hidden_size, 1, [0, hidden_size]),
+        (
+            "gate_up",
+            hidden_size,
+            2 * intermediate_size,
+            2,
+            [0, intermediate_size, 2 * intermediate_size],
+        ),
+        ("down_proj", intermediate_size, hidden_size, 1, [0, hidden_size]),
+    ]
 
-        best = tune_kernel(
-            kernel_name="expand",
-            configs=expand_candidates,
-            benchmark_fn=lambda chunk_size, config, **kw: benchmark_expand(
-                S=S,
-                output_dim=output_dim * num_slices,
-                max_rank=rank,
-                num_slices=num_slices,
-                chunk_size=chunk_size,
-                config=config,
-                max_slice_size=max_slice_size,
-                dtype=dtype,
-                num_iters=args.num_iters,
-            ),
-            benchmark_kwargs={},
-            chunk_sizes=chunk_sizes,
+    print(f"\nLoRA layer dimensions:")
+    for label, sk, eo, ns, so in layers:
+        print(f"  {label:>10}: shrink K={sk}, expand output_dim={eo}, num_slices={ns}")
+
+    return layers
+
+
+def _tune_shrink(
+    label: str,
+    K: int,
+    N: int,
+    num_slices: int,
+    rank: int,
+    chunk_sizes: List[int],
+    total_tokens: int,
+    device: torch.device,
+) -> tuple:
+    """Tune shrink kernel for one layer type. Returns (best_configs, results)."""
+    print(f"\n{'='*80}")
+    print(f"Tuning SHRINK — {label} (K={K}, N={N}, slices={num_slices})")
+    print(f"{'='*80}")
+
+    search = get_shrink_search_space()
+    print(f"Search space: {len(search)} configs")
+
+    best_configs = {}
+    results = {}
+
+    for chunk_size in chunk_sizes:
+        batch_info = build_batch_info(total_tokens, chunk_size, rank, device)
+        x = torch.randn(total_tokens, K, device=device, dtype=torch.float16)
+        weights = torch.randn(2, N, K, device=device, dtype=torch.float16)
+
+        baseline_time = benchmark_shrink_config(
+            _DEFAULT_SHRINK_CONFIG,
+            x,
+            weights,
+            batch_info,
+            num_slices,
+            N,
+            K,
+        )
+        print(f"  chunk={chunk_size}: baseline={baseline_time:.3f}ms")
+
+        best_config = None
+        best_time = float("inf")
+
+        for i, config in enumerate(search):
+            t = benchmark_shrink_config(
+                config, x, weights, batch_info, num_slices, N, K
+            )
+            if t is not None and t < best_time:
+                best_time = t
+                best_config = config
+            if (i + 1) % 20 == 0:
+                print(
+                    f"  chunk={chunk_size}: {i+1}/{len(search)} tested, best={best_time:.3f}ms"
+                )
+
+        best_configs[chunk_size] = sort_config(best_config)
+        results[chunk_size] = (baseline_time, best_time, best_configs[chunk_size])
+        speedup = baseline_time / best_time if best_time > 0 else 0
+        print(
+            f"  chunk={chunk_size}: best={best_time:.3f}ms ({speedup:.2f}x), config={best_configs[chunk_size]}"
         )
 
-        filename = get_lora_config_file_name("expand", output_dim, rank)
-        save_config(best, filename, args.output_dir)
+    return best_configs, results
 
-    print(f"\nDone! Configs saved to {args.output_dir}")
-    print(f"The server will automatically use these configs with --lora-backend csgmv")
+
+def _tune_expand(
+    label: str,
+    output_dim: int,
+    num_slices: int,
+    slice_offsets_list: List[int],
+    max_slice_size: int,
+    rank: int,
+    chunk_sizes: List[int],
+    total_tokens: int,
+    device: torch.device,
+) -> tuple:
+    """Tune expand kernel for one layer type. Returns (best_configs, results)."""
+    print(f"\n{'='*80}")
+    print(f"Tuning EXPAND — {label} (output_dim={output_dim}, slices={num_slices})")
+    print(f"{'='*80}")
+
+    search = get_expand_search_space()
+    print(f"Search space: {len(search)} configs")
+
+    slice_offsets = torch.tensor(slice_offsets_list, dtype=torch.int64, device=device)
+    best_configs = {}
+    results = {}
+
+    for chunk_size in chunk_sizes:
+        batch_info = build_batch_info(total_tokens, chunk_size, rank, device)
+        x = torch.randn(
+            total_tokens, num_slices * rank, device=device, dtype=torch.float16
+        )
+        weights = torch.randn(2, output_dim, rank, device=device, dtype=torch.float16)
+
+        baseline_time = benchmark_expand_config(
+            _DEFAULT_EXPAND_CONFIG,
+            x,
+            weights,
+            batch_info,
+            slice_offsets,
+            max_slice_size,
+            output_dim,
+            num_slices,
+            rank,
+        )
+        print(f"  chunk={chunk_size}: baseline={baseline_time:.3f}ms")
+
+        best_config = None
+        best_time = float("inf")
+
+        for i, config in enumerate(search):
+            t = benchmark_expand_config(
+                config,
+                x,
+                weights,
+                batch_info,
+                slice_offsets,
+                max_slice_size,
+                output_dim,
+                num_slices,
+                rank,
+            )
+            if t is not None and t < best_time:
+                best_time = t
+                best_config = config
+            if (i + 1) % 50 == 0:
+                print(
+                    f"  chunk={chunk_size}: {i+1}/{len(search)} tested, best={best_time:.3f}ms"
+                )
+
+        best_configs[chunk_size] = sort_config(best_config)
+        results[chunk_size] = (baseline_time, best_time, best_configs[chunk_size])
+        speedup = baseline_time / best_time if best_time > 0 else 0
+        print(
+            f"  chunk={chunk_size}: best={best_time:.3f}ms ({speedup:.2f}x), config={best_configs[chunk_size]}"
+        )
+
+    return best_configs, results
+
+
+def main(args: argparse.Namespace):
+    device = torch.device("cuda:0")
+    rank = args.rank
+    chunk_sizes = args.chunk_sizes
+    total_tokens = args.total_tokens
+
+    layers = get_model_dims(args)
+
+    print(f"\nLoRA CSGMV Tuning")
+    print(f"  rank={rank}, total_tokens={total_tokens}, chunk_sizes={chunk_sizes}")
+
+    # Collect all results for summary
+    all_results = []  # (label, kernel, K_or_outdim, results_dict)
+
+    # Deduplicate: multiple layers can share the same (shrink_K, R) or
+    # (expand_output_dim, R). No need to tune the same config twice.
+    tuned_shrink = {}  # shrink_K -> best_configs
+    tuned_expand = {}  # expand_output_dim -> best_configs
+
+    for label, shrink_K, expand_output_dim, num_slices, slice_offsets_list in layers:
+        # --- Shrink ---
+        if shrink_K not in tuned_shrink:
+            N_shrink = num_slices * rank
+            best_configs, results = _tune_shrink(
+                label,
+                shrink_K,
+                N_shrink,
+                num_slices,
+                rank,
+                chunk_sizes,
+                total_tokens,
+                device,
+            )
+            filepath = save_config(best_configs, "shrink", shrink_K, rank)
+            print(f"  Saved to: {filepath}")
+            tuned_shrink[shrink_K] = best_configs
+            all_results.append((label, "shrink", shrink_K, results))
+        else:
+            print(f"\n  Skipping shrink {label} (K={shrink_K}) — already tuned")
+
+        # --- Expand ---
+        if expand_output_dim not in tuned_expand:
+            # max_slice_size = largest slice width
+            slice_widths = [
+                slice_offsets_list[i + 1] - slice_offsets_list[i]
+                for i in range(num_slices)
+            ]
+            max_slice_size = max(slice_widths)
+
+            best_configs, results = _tune_expand(
+                label,
+                expand_output_dim,
+                num_slices,
+                slice_offsets_list,
+                max_slice_size,
+                rank,
+                chunk_sizes,
+                total_tokens,
+                device,
+            )
+            filepath = save_config(best_configs, "expand", expand_output_dim, rank)
+            print(f"  Saved to: {filepath}")
+            tuned_expand[expand_output_dim] = best_configs
+            all_results.append((label, "expand", expand_output_dim, results))
+        else:
+            print(
+                f"\n  Skipping expand {label} (output_dim={expand_output_dim}) — already tuned"
+            )
+
+    # --- Summary ---
+    print(f"\n{'='*80}")
+    print(f"SUMMARY")
+    print(f"{'='*80}")
+    print(
+        f"\n{'layer':<10} {'kernel':<8} {'K/dim':>6} {'chunk':>6}"
+        f" {'baseline':>10} {'tuned':>10} {'speedup':>8}  config"
+    )
+    print("-" * 100)
+    for label, kernel, dim, results in all_results:
+        for chunk_size in chunk_sizes:
+            if chunk_size in results:
+                base, best, cfg = results[chunk_size]
+                spd = base / best if best > 0 else 0
+                print(
+                    f"{label:<10} {kernel:<8} {dim:>6} {chunk_size:>6}"
+                    f" {base:>9.3f}ms {best:>9.3f}ms {spd:>7.2f}x  {cfg}"
+                )
+
+    now = datetime.now()
+    print(f"\nTuning completed at {now.ctime()}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Auto-tune LoRA CSGMV kernel block dimensions"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="HuggingFace model name to auto-derive dimensions "
+        "(e.g., Qwen/Qwen3-0.6B, meta-llama/Llama-2-7b-hf)",
+    )
+    parser.add_argument(
+        "--hidden-size",
+        type=int,
+        default=None,
+        help="Model hidden size (e.g., 1024 for Qwen3-0.6B). "
+        "Required if --model is not specified.",
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        required=True,
+        help="LoRA rank (e.g., 16, 32, 64)",
+    )
+    parser.add_argument(
+        "--qkv-output-dim",
+        type=int,
+        default=None,
+        help="QKV output dimension. Only used with --hidden-size. "
+        "Default: 4 * hidden_size",
+    )
+    parser.add_argument(
+        "--chunk-sizes",
+        type=int,
+        nargs="+",
+        default=[16, 32, 64, 128],
+        help="Chunk sizes to tune (default: 16 32 64 128)",
+    )
+    parser.add_argument(
+        "--total-tokens",
+        type=int,
+        default=30720,
+        help="Total tokens for benchmarking (default: 30720 = 2 reqs x 15360)",
+    )
+    args = parser.parse_args()
+
+    if not args.model and not args.hidden_size:
+        parser.error("Either --model or --hidden-size is required")
+
+    main(args)
