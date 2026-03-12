@@ -99,24 +99,40 @@ def get_token_ids_logprobs(logits, token_ids):
 
 
 def _get_sentence_transformer_embedding_model(
-    model_path, torch_dtype, matryoshka_dim: Optional[int] = None
+    model_path,
+    torch_dtype,
+    matryoshka_dim: Optional[int] = None,
+    pooling_type: Optional[str] = None,
 ):
     from sentence_transformers import SentenceTransformer
     from sentence_transformers.util import is_sentence_transformer_model
 
-    if is_sentence_transformer_model(model_path):
+    # Map pooling_type to sentence-transformers pooling mode
+    pooling_mode_map = {
+        "MEAN": "mean",
+        "LAST": "lasttoken",
+        "CLS": "cls",
+    }
+    pooling_mode = pooling_mode_map.get(pooling_type, "lasttoken")
+
+    if is_sentence_transformer_model(model_path) and pooling_type is None:
         model = SentenceTransformer(
             model_path,
             model_kwargs={"torch_dtype": torch_dtype},
             truncate_dim=matryoshka_dim,
         )
-    else:  # if no pre-trained sentence-transformers model
+    else:  # if no pre-trained sentence-transformers model or custom pooling
         from sentence_transformers import models
 
         word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+        # Set pad token if not available
+        if word_embedding_model.tokenizer.pad_token is None:
+            word_embedding_model.tokenizer.pad_token = (
+                word_embedding_model.tokenizer.eos_token
+            )
         pooling_model = models.Pooling(
             word_embedding_model.get_word_embedding_dimension(),
-            pooling_mode="lasttoken",
+            pooling_mode=pooling_mode,
         )
         model = SentenceTransformer(
             modules=[word_embedding_model, pooling_model], truncate_dim=matryoshka_dim
@@ -150,11 +166,13 @@ class HFRunner:
         trust_remote_code: bool = False,
         patch_model_do_sample_false: bool = False,
         matryoshka_dim: Optional[int] = None,
+        pooling_type: Optional[str] = None,
     ):
         self.model_type = model_type
         self.output_str_only = output_str_only
         self.trust_remote_code = trust_remote_code
         self.patch_model_do_sample_false = patch_model_do_sample_false
+        self.pooling_type = pooling_type
 
         self.in_queue = mp.Queue()
         self.out_queue = mp.Queue()
@@ -286,7 +304,10 @@ class HFRunner:
                 self.processor = AutoProcessor.from_pretrained(model_path)
             else:
                 self.model = _get_sentence_transformer_embedding_model(
-                    model_path, torch_dtype, matryoshka_dim=matryoshka_dim
+                    model_path,
+                    torch_dtype,
+                    matryoshka_dim=matryoshka_dim,
+                    pooling_type=self.pooling_type,
                 )
         elif self.model_type == "reward" or self.model_type == "cross_encoder":
             from transformers import AutoModelForSequenceClassification
@@ -562,6 +583,7 @@ class SRTRunner:
         json_model_override_args: Optional[dict[str, Any]] = None,
         lora_eviction_policy: str = "lru",
         enable_deterministic_inference: bool = False,
+        pooling_type: Optional[str] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -628,6 +650,7 @@ class SRTRunner:
             ),
             lora_eviction_policy=lora_eviction_policy,
             enable_deterministic_inference=enable_deterministic_inference,
+            pooling_type=pooling_type,
             **spec_kwargs,
         )
 

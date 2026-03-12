@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.configs.model_config import PoolerConfig
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -362,6 +363,7 @@ class Qwen3ForCausalLM(nn.Module):
         config: Qwen3Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        pooler_config: Optional[PoolerConfig] = None,
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
@@ -388,7 +390,9 @@ class Qwen3ForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.pooler = Pooler.from_pooler_config(
+            pooler_config, default_type=PoolingType.LAST, default_normalize=True
+        )
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False

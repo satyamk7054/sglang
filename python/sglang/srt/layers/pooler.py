@@ -1,9 +1,14 @@
 # adapted from
 # https://github.com/vllm-project/vllm/blob/82a1b1a82b1fbb454c82a9ef95730b929c9b270c/vllm/model_executor/layers/pooler.py
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import PoolerConfig
 
 import torch
 import torch.nn as nn
@@ -16,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class PoolingType(IntEnum):
     LAST = 0
     CLS = 1
+    MEAN = 2
 
 
 @dataclass
@@ -41,6 +47,19 @@ class Pooler(nn.Module):
         self.pooling_type = pooling_type
         self.normalize = normalize
 
+    @staticmethod
+    def from_pooler_config(
+        pooler_config: Optional["PoolerConfig"],
+        default_type: PoolingType,
+        default_normalize: bool,
+    ) -> "Pooler":
+        if pooler_config is not None:
+            return Pooler(
+                pooling_type=pooler_config.pooling_type,
+                normalize=pooler_config.normalize,
+            )
+        return Pooler(pooling_type=default_type, normalize=default_normalize)
+
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> EmbeddingPoolerOutput:
@@ -53,6 +72,22 @@ class Pooler(nn.Module):
             first_token_flat_indices = torch.zeros_like(prompt_lens)
             first_token_flat_indices[1:] += torch.cumsum(prompt_lens, dim=0)[:-1]
             pooled_data = hidden_states[first_token_flat_indices]
+        elif self.pooling_type == PoolingType.MEAN:
+            seq_lens = forward_batch.extend_seq_lens
+            num_seqs = seq_lens.shape[0]
+            hidden_dim = hidden_states.shape[-1]
+            # Build segment IDs for each token
+            segment_ids = torch.arange(
+                num_seqs, device=seq_lens.device
+            ).repeat_interleave(seq_lens)
+            # Accumulate hidden states per segment in float32 to prevent overflow
+            pooled_data = torch.zeros(
+                num_seqs, hidden_dim, dtype=torch.float32, device=hidden_states.device
+            )
+            pooled_data.index_add_(0, segment_ids, hidden_states.to(torch.float32))
+            # Divide by sequence lengths to get mean
+            pooled_data = pooled_data / seq_lens.unsqueeze(1).to(torch.float32)
+            pooled_data = pooled_data.to(hidden_states.dtype)
         else:
             raise ValueError(f"Invalid pooling type: {self.pooling_type}")
 

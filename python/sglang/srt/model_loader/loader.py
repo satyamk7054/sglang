@@ -260,6 +260,8 @@ def _initialize_model(
     quant_config: Optional[QuantizationConfig] = None,
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
+    import inspect
+
     model_class, _ = get_model_architecture(model_config)
     kwargs = {
         "config": model_config.hf_config,
@@ -273,6 +275,17 @@ def _initialize_model(
 
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
+
+    # Pass pooler_config if the model supports it
+    if model_config.pooler_config is not None:
+        sig = inspect.signature(model_class.__init__)
+        if "pooler_config" in sig.parameters:
+            kwargs["pooler_config"] = model_config.pooler_config
+        else:
+            logger.info(
+                f"{model_class.__name__} does not accept pooler_config, "
+                f"using model default pooling."
+            )
 
     return model_class(**kwargs)
 

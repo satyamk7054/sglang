@@ -132,6 +132,48 @@ class TestEmbeddingModels(CustomTestCase):
                     DEFAULT_PROMPTS, model, tp_size, torch_dtype, prefill_tolerance
                 )
 
+    def test_mean_pooling(self):
+        """Test MEAN pooling by comparing HF sentence-transformers vs SRT."""
+        model_path = "intfloat/e5-mistral-7b-instruct"
+        tp_size = 1
+        prefill_tolerance = 1e-5
+        torch_dtype = torch.float16
+
+        truncated_prompts = self._truncate_prompts(DEFAULT_PROMPTS, model_path)
+
+        with HFRunner(
+            model_path,
+            torch_dtype=torch_dtype,
+            model_type="embedding",
+            pooling_type="MEAN",
+        ) as hf_runner:
+            hf_outputs = hf_runner.forward(truncated_prompts)
+
+        attention_backend = "triton" if is_in_amd_ci() else None
+        with SRTRunner(
+            model_path,
+            tp_size=tp_size,
+            torch_dtype=torch_dtype,
+            model_type="embedding",
+            attention_backend=attention_backend,
+            pooling_type="MEAN",
+            chunked_prefill_size=-1,
+            disable_radix_cache=True,
+        ) as srt_runner:
+            srt_outputs = srt_runner.forward(truncated_prompts)
+
+        for i in range(len(truncated_prompts)):
+            hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
+            srt_logits = torch.Tensor(srt_outputs.embed_logits[i])
+
+            similarity = torch.tensor(get_similarities(hf_logits, srt_logits))
+            print(f"mean pooling similarity diff [{i}]", abs(similarity - 1))
+
+            if len(truncated_prompts[i]) <= 1000:
+                assert torch.all(
+                    abs(similarity - 1) < prefill_tolerance
+                ), "MEAN pooling embeddings are not all close"
+
     def test_matryoshka_embedding(self):
         models_to_test = [
             (

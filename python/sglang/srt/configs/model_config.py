@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+from dataclasses import dataclass
 from enum import Enum, IntEnum, auto
 from pathlib import Path
 from typing import Any, List, Optional, Set, Union
@@ -82,6 +83,25 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+@dataclass
+class PoolerConfig:
+    """Configuration for the pooling layer."""
+
+    pooling_type: int  # PoolingType IntEnum value
+    normalize: bool
+
+    @classmethod
+    def from_server_args(cls, server_args: ServerArgs) -> Optional["PoolerConfig"]:
+        from sglang.srt.layers.pooler import PoolingType
+
+        if server_args.pooling_type is None:
+            return None
+        return cls(
+            pooling_type=PoolingType[server_args.pooling_type],
+            normalize=True,
+        )
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -103,9 +123,11 @@ class ModelConfig:
         encoder_only: bool = False,
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
+        pooler_config: Optional[PoolerConfig] = None,
     ) -> None:
         # Parse args
         self.model_path = model_path
+        self.pooler_config = pooler_config
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
@@ -271,6 +293,7 @@ class ModelConfig:
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
+            pooler_config=PoolerConfig.from_server_args(server_args),
             **kwargs,
         )
 

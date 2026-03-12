@@ -298,6 +298,7 @@ class ServerArgs:
     trust_remote_code: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
+    pooling_type: Optional[str] = None
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
@@ -823,6 +824,22 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
+
+        # Validate pooling type settings.
+        self._handle_pooling_type()
+
+    def _handle_pooling_type(self):
+        if self.pooling_type == "MEAN":
+            if self.chunked_prefill_size is None or self.chunked_prefill_size != -1:
+                raise ValueError(
+                    "MEAN pooling requires --chunked-prefill-size=-1 "
+                    "(chunked prefill must be disabled)."
+                )
+            if not self.disable_radix_cache:
+                raise ValueError(
+                    "MEAN pooling requires --disable-radix-cache "
+                    "(radix cache must be disabled)."
+                )
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -3360,6 +3377,14 @@ class ServerArgs:
             "--is-embedding",
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
+        )
+        parser.add_argument(
+            "--pooling-type",
+            type=str,
+            default=ServerArgs.pooling_type,
+            choices=["LAST", "CLS", "MEAN"],
+            help="The pooling strategy for embedding models. Choices: LAST, CLS, MEAN. "
+            "MEAN pooling requires --chunked-prefill-size=-1 and --disable-radix-cache.",
         )
         parser.add_argument(
             "--enable-multimodal",

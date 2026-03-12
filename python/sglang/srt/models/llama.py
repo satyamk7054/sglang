@@ -23,6 +23,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.configs.model_config import PoolerConfig
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -460,6 +461,7 @@ class LlamaForCausalLM(nn.Module):
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        pooler_config: Optional[PoolerConfig] = None,
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
@@ -479,7 +481,9 @@ class LlamaForCausalLM(nn.Module):
                 use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
             )
         self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.pooler = Pooler.from_pooler_config(
+            pooler_config, default_type=PoolingType.LAST, default_normalize=True
+        )
         self.stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
