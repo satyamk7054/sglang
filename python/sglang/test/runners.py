@@ -115,6 +115,9 @@ def _get_sentence_transformer_embedding_model(
     }
     pooling_mode = pooling_mode_map.get(pooling_type, "lasttoken")
 
+    # Use FP32 for MEAN pooling to prevent overflow on long sequences
+    model_dtype = torch.float32 if pooling_type == "MEAN" else torch_dtype
+
     if is_sentence_transformer_model(model_path) and pooling_type is None:
         model = SentenceTransformer(
             model_path,
@@ -124,7 +127,7 @@ def _get_sentence_transformer_embedding_model(
     else:  # if no pre-trained sentence-transformers model or custom pooling
         from sentence_transformers import models
 
-        word_embedding_model = models.Transformer(model_path).to(dtype=torch_dtype)
+        word_embedding_model = models.Transformer(model_path).to(dtype=model_dtype)
         # Set pad token if not available
         if word_embedding_model.tokenizer.pad_token is None:
             word_embedding_model.tokenizer.pad_token = (

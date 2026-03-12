@@ -166,17 +166,6 @@ class TestEmbeddingModels(CustomTestCase):
             hf_logits = torch.Tensor(hf_outputs.embed_logits[i])
             srt_logits = torch.Tensor(srt_outputs.embed_logits[i])
 
-            # Long prompts may overflow FP16 in HF's mean pooling (no FP32 upcast),
-            # producing inf/nan. SRT uses FP32 accumulation so it's fine, but the
-            # HF reference is unreliable for long sequences — skip comparison.
-            hf_has_inf_nan = hf_logits.isinf().any() or hf_logits.isnan().any()
-            if hf_has_inf_nan:
-                print(
-                    f"mean pooling [{i}]: skipping — HF embedding has inf/nan "
-                    f"(FP16 overflow on {len(truncated_prompts[i])} char prompt)"
-                )
-                continue
-
             similarity = torch.tensor(get_similarities(hf_logits, srt_logits))
             print(f"mean pooling similarity diff [{i}]", abs(similarity - 1))
 
