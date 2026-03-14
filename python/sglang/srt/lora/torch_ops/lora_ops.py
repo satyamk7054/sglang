@@ -104,10 +104,11 @@ def sgemm_lora_b_fwd(
                 lora_idx, slice_start_output:slice_end_output, :rank
             ]  # (slice_dim, rank)
 
-            output[
+            out_slice = output[
                 token_offset : token_offset + seq_len,
                 slice_start_output:slice_end_output,
-            ].add_(torch.mm(x_slice, w_slice.T))
+            ]
+            torch.addmm(out_slice, x_slice, w_slice.T, beta=1, alpha=1, out=out_slice)
 
         token_offset += seq_len
 
