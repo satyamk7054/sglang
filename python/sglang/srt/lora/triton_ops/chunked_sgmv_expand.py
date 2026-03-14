@@ -8,7 +8,14 @@ from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 
 
-@cached_triton_kernel(lambda _, kwargs: (kwargs["NUM_SLICES"], kwargs["BLOCK_M"]))
+@cached_triton_kernel(
+    lambda _, kwargs: (
+        kwargs["NUM_SLICES"],
+        kwargs["BLOCK_M"],
+        kwargs["SLICE0_BLOCKS"],
+        kwargs["SLICE1_BLOCKS"],
+    )
+)
 @triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_expand_kernel(
     # Pointers to matrices
@@ -32,6 +39,9 @@ def _chunked_lora_expand_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    # Per-slice block counts (constexpr for branch-free decode)
+    SLICE0_BLOCKS: tl.constexpr,
+    SLICE1_BLOCKS: tl.constexpr,
 ):
     """
     Computes a chunked SGMV for LoRA expand operations.
@@ -39,6 +49,11 @@ def _chunked_lora_expand_kernel(
     When a sequence's rank is 0, the kernel is essentially a no-op, following
     the convention in pytorch where the product of two matrices of shape (m, 0)
     and (0, n) is an all-zero matrix of shape (m, n).
+
+    The grid packs all (slice, N-tile) combinations into axis 0 to avoid
+    wasting thread blocks when slices have different widths (e.g. GQA where
+    Q is wider than K/V). The decode uses constexpr block counts so the
+    compiler eliminates all branches — pure register arithmetic.
 
     Args:
         x (Tensor): The input tensor, which is the result of the LoRA A projection.
@@ -48,6 +63,8 @@ def _chunked_lora_expand_kernel(
             Shape: (num_lora, output_dim, K).
         output (Tensor): The output tensor where the result is stored.
             Shape: (s, output_dim).
+        SLICE0_BLOCKS: Number of N-blocks for slice 0 (cdiv(slice0_width, BLOCK_N)).
+        SLICE1_BLOCKS: Number of N-blocks for slice 1. 0 if NUM_SLICES == 1.
     """
     tl.static_assert(NUM_SLICES <= 3)
 
@@ -61,7 +78,7 @@ def _chunked_lora_expand_kernel(
     output_stride_0: tl.constexpr = OUTPUT_DIM
     output_stride_1: tl.constexpr = 1
 
-    pid_s = tl.program_id(axis=2)
+    pid_s = tl.program_id(axis=1)
     if pid_s >= num_segs:
         return
 
@@ -78,7 +95,30 @@ def _chunked_lora_expand_kernel(
     seg_start = tl.load(seg_indptr + pid_s)
     seg_end = tl.load(seg_indptr + pid_s + 1)
 
-    slice_id = tl.program_id(axis=1)
+    # Decode packed pid_flat → (slice_id, pid_n) using constexpr block counts.
+    # No memory loads or runtime branches — compiler resolves statically.
+    pid_flat = tl.program_id(axis=0)
+    if NUM_SLICES == 1:
+        slice_id = 0
+        pid_n = pid_flat
+    elif NUM_SLICES == 2:
+        if pid_flat < SLICE0_BLOCKS:
+            slice_id = 0
+            pid_n = pid_flat
+        else:
+            slice_id = 1
+            pid_n = pid_flat - SLICE0_BLOCKS
+    else:  # NUM_SLICES == 3
+        if pid_flat < SLICE0_BLOCKS:
+            slice_id = 0
+            pid_n = pid_flat
+        elif pid_flat < SLICE0_BLOCKS + SLICE1_BLOCKS:
+            slice_id = 1
+            pid_n = pid_flat - SLICE0_BLOCKS
+        else:
+            slice_id = 2
+            pid_n = pid_flat - SLICE0_BLOCKS - SLICE1_BLOCKS
+
     slice_start = tl.load(slice_offsets + slice_id)
     slice_end = tl.load(slice_offsets + slice_id + 1)
 
@@ -95,7 +135,6 @@ def _chunked_lora_expand_kernel(
     # Create pointers for the first block of x and weights[batch_id][n_start: n_end][:]
     # The pointers will be advanced as we move in the K direction
     # and accumulate
-    pid_n = tl.program_id(axis=0)
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N + slice_start
     k_offset = tl.arange(0, BLOCK_K)
 
@@ -142,6 +181,26 @@ def _chunked_lora_expand_kernel(
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
+def compute_slice_block_config(
+    slice_offsets: torch.Tensor, BLOCK_N: int = 64
+) -> tuple[int, int, int]:
+    """Precompute per-slice block counts at init time.
+
+    Call once when slice_offsets is created (e.g. in layer __init__),
+    then pass the result to chunked_sgmv_lora_expand_forward to avoid
+    a D2H sync on every forward call.
+
+    Returns:
+        (SLICE0_BLOCKS, SLICE1_BLOCKS, total_n_blocks)
+    """
+    offsets = slice_offsets.tolist()
+    num_slices = len(offsets) - 1
+    blocks = [
+        triton.cdiv(offsets[i + 1] - offsets[i], BLOCK_N) for i in range(num_slices)
+    ]
+    return blocks[0], blocks[1] if num_slices > 1 else 0, sum(blocks)
+
+
 def chunked_sgmv_lora_expand_forward(
     x: torch.Tensor,
     weights: torch.Tensor,
@@ -149,6 +208,7 @@ def chunked_sgmv_lora_expand_forward(
     slice_offsets: torch.Tensor,
     max_slice_size: int,
     base_output: Optional[torch.Tensor],
+    slice_block_config: Optional[tuple[int, int, int]] = None,
 ) -> torch.Tensor:
 
     # x: (s, slice_num * r)
@@ -180,9 +240,16 @@ def chunked_sgmv_lora_expand_forward(
 
     num_segments = batch_info.num_segments
 
+    # Use precomputed block config or compute on the fly
+    if slice_block_config is not None:
+        SLICE0_BLOCKS, SLICE1_BLOCKS, total_n_blocks = slice_block_config
+    else:
+        SLICE0_BLOCKS, SLICE1_BLOCKS, total_n_blocks = compute_slice_block_config(
+            slice_offsets, BLOCK_N
+        )
+
     grid = (
-        triton.cdiv(max_slice_size, BLOCK_N),
-        num_slices,  # number of slices in the input/output
+        total_n_blocks,
         batch_info.bs if batch_info.use_cuda_graph else num_segments,
     )
 
@@ -209,6 +276,8 @@ def chunked_sgmv_lora_expand_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        SLICE0_BLOCKS=SLICE0_BLOCKS,
+        SLICE1_BLOCKS=SLICE1_BLOCKS,
     )
 
     return output

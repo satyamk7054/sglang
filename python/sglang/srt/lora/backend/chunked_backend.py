@@ -4,6 +4,7 @@ from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.triton_ops import (
     chunked_sgmv_lora_expand_forward,
     chunked_sgmv_lora_shrink_forward,
+    compute_slice_block_config,
 )
 from sglang.srt.lora.utils import LoRABatchInfo, generate_sequence_lengths
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -32,6 +33,19 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
     ):
         super().__init__(max_loras_per_batch, device)
         self.max_chunk_size = server_args.max_lora_chunk_size
+        # Cache for precomputed slice block configs, keyed by tensor data_ptr
+        self._slice_block_config_cache: dict[int, tuple[int, int, int]] = {}
+
+    def _get_slice_block_config(
+        self, slice_offsets: torch.Tensor
+    ) -> tuple[int, int, int]:
+        """Get or compute slice block config, cached by tensor identity."""
+        key = slice_offsets.data_ptr()
+        if key not in self._slice_block_config_cache:
+            self._slice_block_config_cache[key] = compute_slice_block_config(
+                slice_offsets
+            )
+        return self._slice_block_config_cache[key]
 
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
@@ -62,6 +76,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             slice_offsets=output_offset,
             max_slice_size=max_slice_size,
             base_output=base_output,
+            slice_block_config=self._get_slice_block_config(output_offset),
         )
 
     def run_qkv_lora(
@@ -94,6 +109,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             slice_offsets=output_offset,
             max_slice_size=max_qkv_out_dim,
             base_output=base_output,
+            slice_block_config=self._get_slice_block_config(output_offset),
         )
         return lora_output
 
@@ -128,6 +144,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             slice_offsets=output_offset,
             max_slice_size=output_dim,
             base_output=base_output,
+            slice_block_config=self._get_slice_block_config(output_offset),
         )
         return lora_output
 
