@@ -23,6 +23,8 @@ def sgemm_lora_a_fwd(
         total_seq_len, num_slices * max_rank, dtype=inputs.dtype, device=inputs.device
     )
 
+    scalings_cpu = scaling_tensor.cpu()
+
     token_offset = 0
     for lora_idx, seq_len, rank in zip(
         weight_indices, seg_len_tensor, lora_ranks[weight_indices]
@@ -31,13 +33,19 @@ def sgemm_lora_a_fwd(
             continue
 
         if rank > 0:
-
             x_seq = inputs[token_offset : token_offset + seq_len, :]
             w_seq = weights[lora_idx, : num_slices * rank, :]
 
-            result = torch.mm(x_seq, w_seq.T)
-            output[token_offset : token_offset + seq_len, : num_slices * rank] = (
-                scaling_tensor[lora_idx] * result
+            out_slice = output[
+                token_offset : token_offset + seq_len, : num_slices * rank
+            ]
+            torch.addmm(
+                out_slice,
+                x_seq,
+                w_seq.T,
+                beta=0,
+                alpha=scalings_cpu[lora_idx],
+                out=out_slice,
             )
 
         token_offset += seq_len
