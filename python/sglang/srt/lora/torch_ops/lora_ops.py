@@ -23,8 +23,6 @@ def sgemm_lora_a_fwd(
         total_seq_len, num_slices * max_rank, dtype=inputs.dtype, device=inputs.device
     )
 
-    scalings_cpu = scaling_tensor.cpu()
-
     token_offset = 0
     for lora_idx, seq_len, rank in zip(
         weight_indices, seg_len_tensor, lora_ranks[weight_indices]
@@ -44,7 +42,7 @@ def sgemm_lora_a_fwd(
                 x_seq,
                 w_seq.T,
                 beta=0,
-                alpha=scalings_cpu[lora_idx],
+                alpha=scaling_tensor[lora_idx],
                 out=out_slice,
             )
 
