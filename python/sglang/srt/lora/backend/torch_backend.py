@@ -144,7 +144,6 @@ class TorchNativeLoRABackend(BaseLoRABackend):
             slice_offsets=output_offset,
             base_output=base_output,
         )
-
         return output_tensor
 
     def init_cuda_graph_batch_info(
