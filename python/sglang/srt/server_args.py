@@ -240,6 +240,18 @@ MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
 
 
+def parse_bool(value: str) -> bool:
+    """argparse `type=` callable for value-taking boolean flags."""
+    v = value.strip().lower()
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Expected 'true' or 'false' (case-insensitive); got {value!r}."
+    )
+
+
 # Allow external code to add more choices
 def add_load_format_choices(choices):
     LOAD_FORMAT_CHOICES.extend(choices)
@@ -312,6 +324,7 @@ class ServerArgs:
     trust_remote_code: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
+    pooler_should_normalize: Optional[bool] = None
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
@@ -4192,6 +4205,17 @@ class ServerArgs:
             "--is-embedding",
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
+        )
+        parser.add_argument(
+            "--pooler-should-normalize",
+            type=parse_bool,
+            default=ServerArgs.pooler_should_normalize,
+            help="Force the embedding Pooler's L2-normalize step on or off, "
+            "regardless of the per-model default (e.g. pass "
+            "--pooler-should-normalize false to emit raw embeddings from a "
+            "model whose Pooler is constructed with normalize=True). Accepts "
+            "'true' or 'false' (case-insensitive); unset preserves the model "
+            "default.",
         )
         parser.add_argument(
             "--enable-multimodal",
