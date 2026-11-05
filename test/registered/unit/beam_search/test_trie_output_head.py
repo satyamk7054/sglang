@@ -59,6 +59,59 @@ def test_full_projection_preserves_scores():
     )
 
 
+def _naive_normalizer(hidden_states, weight, vocab_size, transform):
+    logits = transform(torch.matmul(hidden_states, weight[:vocab_size].T)).float()
+    row_max = logits.max(dim=-1).values
+    return torch.stack(
+        (row_max, torch.logsumexp(logits, dim=-1) - row_max),
+        dim=1,
+    )
+
+
+@pytest.mark.parametrize(
+    "vocab_size,weight_rows,chunk_size,expected_widths",
+    [
+        # Unaligned tail projects through the padded rows: 100 -> 128.
+        (100, 128, 32, [32, 32, 32, 32]),
+        # Single unaligned chunk.
+        (45, 64, 8192, [64]),
+        # Padding shorter than the alignment is used as far as it goes.
+        (70, 72, 64, [64, 8]),
+        # Unpadded weight keeps the logical tail width.
+        (45, 45, 16, [16, 16, 13]),
+        # Aligned vocabulary is unchanged.
+        (128, 192, 64, [64, 64]),
+    ],
+)
+def test_normalizer_matches_naive_logsumexp_with_padded_tail(
+    vocab_size, weight_rows, chunk_size, expected_widths
+):
+    torch.manual_seed(0)
+    hidden_states = torch.randn(4, 6)
+    weight = torch.randn(weight_rows, 6)
+    # Padding rows hold large values so any leak into the normalizer shows.
+    weight[vocab_size:] = 50.0
+    projected_widths = []
+
+    def project(states, selected_weight):
+        projected_widths.append(selected_weight.shape[0])
+        return torch.matmul(states, selected_weight.T)
+
+    def transform(logits):
+        return 2.0 * logits + 3.0
+
+    head = BeamTrieOutputHead(_config(), vocab_size=vocab_size, chunk_size=chunk_size)
+    normalizer = head._stream_normalizer(hidden_states, weight, project, transform)
+
+    assert projected_widths == expected_widths
+    assert torch.allclose(
+        normalizer,
+        _naive_normalizer(hidden_states, weight, vocab_size, transform),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
 def test_topk_logprob_skips_full_vocabulary_normalizer():
     torch.manual_seed(0)
     hidden_states = torch.randn(3, 5)

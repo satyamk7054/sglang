@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _DEFAULT_NORMALIZER_CHUNK_SIZE = 8192
+_NORMALIZER_TAIL_ALIGNMENT = 64
 logger = logging.getLogger(__name__)
 
 
@@ -181,12 +182,25 @@ class BeamTrieOutputHead:
                 f"({weight.shape[0]})"
             )
 
+        # LM-head rows are padded past the vocabulary (VocabParallelEmbedding
+        # pads to a multiple of 64 and zero-fills). Projecting the tail chunk
+        # through the padded end keeps its GEMM width aligned; an unaligned
+        # width drops cuBLAS to a several-times-slower kernel. The padded
+        # columns are sliced off before the logsumexp.
+        aligned_vocab_end = min(
+            -(-self.vocab_size // _NORMALIZER_TAIL_ALIGNMENT)
+            * _NORMALIZER_TAIL_ALIGNMENT,
+            weight.shape[0],
+        )
         row_max = None
         row_log_sum = None
         for start in range(0, self.vocab_size, self.chunk_size):
             logical_end = min(start + self.chunk_size, self.vocab_size)
-            chunk_logits = project(hidden_states, weight[start:logical_end])
-            chunk_logits = transform(chunk_logits)
+            physical_end = (
+                aligned_vocab_end if logical_end == self.vocab_size else logical_end
+            )
+            chunk_logits = project(hidden_states, weight[start:physical_end])
+            chunk_logits = transform(chunk_logits)[:, : logical_end - start]
             if chunk_logits.is_cuda:
                 from sglang.srt.layers.logsumexp import row_logsumexp
 
