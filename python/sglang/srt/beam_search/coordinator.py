@@ -117,6 +117,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
     _trie_selection_graph_cache: Optional[TrieSelectionGraphCache] = None
+    # Set by event loops that flush held outputs after each launch: a finished
+    # group's finalize/pack/send then runs while the next batch is on the GPU.
+    defer_finished_outputs: bool = False
+    _deferred_output_leaders: List[Req] = msgspec.field(default_factory=list)
 
     def __post_init__(self) -> None:
         config = self.model_config.beam_trie_config
@@ -612,16 +616,44 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 storage.free_tokens(orphans)
 
     def _finish_group(self, group: BeamGroup) -> None:
-        # The leader carries the best sequence's finish reason.
-        group.final_results = group.finalize()
-        top = group.final_results[0]
         leader = group.leader
-        if top.matched_token is not None:
-            leader.finish_outside_step(FINISH_MATCHED_TOKEN(matched=top.matched_token))
-        else:
+        # Deferred: free the rows now so the next wave can be admitted, and hold
+        # finalize/pack/send until take_deferred_outputs.
+        defer = self.defer_finished_outputs
+        if defer and group.device_history:
+            # Device-history results never end on a stop token, so the finish
+            # reason needs no finalize; only the D2H copy starts here.
+            group.stage_final_results()
             leader.finish_outside_step(FINISH_LENGTH(length=group.num_committed))
+        else:
+            # The leader carries the best sequence's finish reason.
+            group.final_results = group.finalize()
+            top = group.final_results[0]
+            if top.matched_token is not None:
+                leader.finish_outside_step(
+                    FINISH_MATCHED_TOKEN(matched=top.matched_token)
+                )
+            else:
+                leader.finish_outside_step(FINISH_LENGTH(length=group.num_committed))
+        if defer:
+            leader.defer_output = True
+            self._deferred_output_leaders.append(leader)
         self._free_member_rows(group)
         self._retire_group(group)
+
+    def has_deferred_outputs(self) -> bool:
+        return bool(self._deferred_output_leaders)
+
+    def take_deferred_outputs(self) -> List[Req]:
+        """Finalize the held finished groups and release their leaders for
+        streaming, in finish order."""
+        leaders, self._deferred_output_leaders = self._deferred_output_leaders, []
+        for leader in leaders:
+            group = leader.beam_group
+            if group.final_results is None:
+                group.final_results = group.finalize()
+            leader.defer_output = False
+        return leaders
 
     def _abort_group(self, group: BeamGroup) -> None:
         group.state = BeamGroupState.FINISHED

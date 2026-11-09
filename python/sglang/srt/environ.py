@@ -732,6 +732,9 @@ class Envs:
     SGLANG_BEAM_SHARED_CONTEXT_WIDTH = EnvInt(2000)
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT = EnvInt(32768)
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE = EnvInt(8)
+    # Kill switch: finalize/pack/send finished beam groups inline instead of
+    # after the next batch launch.
+    SGLANG_DISABLE_BEAM_DEFERRED_OUTPUT = EnvBool(False)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism

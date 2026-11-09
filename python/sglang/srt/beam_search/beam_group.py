@@ -89,12 +89,17 @@ class BeamGroup:
         self.num_generated = 0
         self.num_committed = 0
         self.completed: List[CompletedBeam] = []
+        # Set at finish; None while a deferred finalize is pending.
+        self.final_results: Optional[List[BeamResult]] = None
         self.state = BeamGroupState.DECODING
         self.device_history = device_history
         self._device_tokens: List[torch.Tensor] = []
         self._device_parents: List[torch.Tensor] = []
         self._device_final_tokens: Optional[torch.Tensor] = None
         self._device_final_cum_logprobs: Optional[torch.Tensor] = None
+        # (tokens, cum_logprobs, ready event) host copies started by
+        # stage_final_results; finalize reads them without a stream sync.
+        self._host_final: Optional[tuple] = None
         # Selection results staged by the launch half as (forward tick, sel),
         # consumed in tick order by commit.
         self._pending_steps: List[tuple] = []
@@ -286,14 +291,42 @@ class BeamGroup:
         """Length-normalized score: cum_logprob / num_tokens ** length_penalty."""
         return cum_logprob / (num_tokens**self.length_penalty)
 
+    def stage_final_results(self) -> None:
+        """Start the device-to-host copy of a device-history group's final
+        beams. A later finalize then waits on this copy alone, not on work
+        launched after it (e.g. the next batch's forward)."""
+        assert self.state == BeamGroupState.FINISHED and self.device_history
+        tokens = self._device_final_tokens
+        cum_logprobs = self._device_final_cum_logprobs
+        if tokens.is_cuda:
+            host_tokens = torch.empty(
+                tokens.shape, dtype=tokens.dtype, pin_memory=True
+            ).copy_(tokens, non_blocking=True)
+            host_cums = torch.empty(
+                cum_logprobs.shape, dtype=cum_logprobs.dtype, pin_memory=True
+            ).copy_(cum_logprobs, non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record()
+        else:
+            host_tokens, host_cums, ready = tokens.cpu(), cum_logprobs.cpu(), None
+        self._host_final = (host_tokens, host_cums, ready)
+
     def finalize(self) -> List[BeamResult]:
         """Materialize the top beam_width sequences, best score first."""
         assert self.state == BeamGroupState.FINISHED
         if self.device_history:
-            assert self._device_final_tokens is not None
-            assert self._device_final_cum_logprobs is not None
-            token_rows = self._device_final_tokens.tolist()
-            cum_logprobs = self._device_final_cum_logprobs.tolist()
+            if self._host_final is not None:
+                host_tokens, host_cums, ready = self._host_final
+                if ready is not None:
+                    ready.synchronize()
+                token_rows = host_tokens.tolist()
+                cum_logprobs = host_cums.tolist()
+                self._host_final = None
+            else:
+                assert self._device_final_tokens is not None
+                assert self._device_final_cum_logprobs is not None
+                token_rows = self._device_final_tokens.tolist()
+                cum_logprobs = self._device_final_cum_logprobs.tolist()
             results = [
                 BeamResult(
                     tokens=tokens,
