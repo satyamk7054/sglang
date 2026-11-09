@@ -2189,6 +2189,7 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        self.enable_beam_deferred_output()
         while True:
             if self.gracefully_exit:
                 break
@@ -2197,6 +2198,7 @@ class Scheduler(
             # Receive requests
             self.ingest_requests()
             if self.pause_state.paused:
+                self.flush_deferred_beam_outputs()
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -2211,8 +2213,11 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                # Held beam outputs run while this forward is on the GPU.
+                self.flush_deferred_beam_outputs()
                 self.process_batch_result(batch, result)
             else:
+                self.flush_deferred_beam_outputs()
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
                 self.on_idle()
@@ -2225,6 +2230,7 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.enable_skip_finishing_decode = True
+        self.enable_beam_deferred_output()
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -2242,6 +2248,7 @@ class Scheduler(
             # Receive requests
             self.ingest_requests()
             if self.pause_state.paused:
+                self.flush_deferred_beam_outputs()
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -2275,6 +2282,9 @@ class Scheduler(
             else:
                 batch_result = None
                 self._sched_idled = True
+                # Nothing launched to overlap with; release what earlier
+                # iterations held before a possible idle sleep.
+                self.flush_deferred_beam_outputs()
 
             # Process the last batch
             if self.last_batch:
@@ -2288,6 +2298,10 @@ class Scheduler(
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result, batch)
+
+            if batch:
+                # Held beam outputs run while this batch is on the GPU.
+                self.flush_deferred_beam_outputs()
 
             # Update last_batch
             self.last_batch = batch
@@ -2998,6 +3012,22 @@ class Scheduler(
                 tree_cache=self.tree_cache,
                 request_retirer=self.request_retirer,
             )
+
+    def enable_beam_deferred_output(self) -> None:
+        """Opt in from an event loop that calls flush_deferred_beam_outputs
+        after every launch and before every idle sleep."""
+        if envs.SGLANG_DISABLE_BEAM_DEFERRED_OUTPUT.get():
+            return
+        self.beam_coordinator.defer_finished_outputs = True
+        self.output_streamer.defer_outputs = True
+
+    def flush_deferred_beam_outputs(self) -> None:
+        """Finalize, pack, and send finished beam groups held since their
+        commit freed their rows."""
+        if not self.beam_coordinator.has_deferred_outputs():
+            return
+        leaders = self.beam_coordinator.take_deferred_outputs()
+        self.output_streamer.stream_output(leaders, False)
 
     def init_batch_result_processor(self) -> None:
         self.batch_result_processor = SchedulerBatchResultProcessor(
@@ -6990,6 +7020,8 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     # A PD role switch can select a different loop on the same scheduler.
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
+    scheduler.flush_deferred_beam_outputs()
+    scheduler.beam_coordinator.defer_finished_outputs = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if get_parallel().pp_size > 1:
