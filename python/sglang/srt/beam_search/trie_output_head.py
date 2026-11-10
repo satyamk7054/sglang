@@ -11,7 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Compact SID projection with streamed full-vocabulary normalization."""
+"""Compact SID projection with a streamed full-vocabulary (or, opt-in,
+active-codebook) log-softmax normalizer."""
 
 from __future__ import annotations
 
@@ -35,11 +36,39 @@ logger = logging.getLogger(__name__)
 
 class BeamTrieHeadOutput(msgspec.Struct, frozen=True):
     logits: torch.Tensor
+    # [rows, 2] fp32 (max, logsumexp - max); None scores over the top-k only.
     normalizer: Optional[torch.Tensor]
 
 
 def use_topk_logprob() -> bool:
     return envs.SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB.get()
+
+
+def use_codebook_normalizer() -> bool:
+    enabled = envs.SGLANG_OPT_BEAM_TRIE_CODEBOOK_NORMALIZER.get()
+    if enabled and use_topk_logprob():
+        raise ValueError(
+            "SGLANG_OPT_BEAM_TRIE_CODEBOOK_NORMALIZER and "
+            "SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB are mutually exclusive"
+        )
+    return enabled
+
+
+def row_log_normalizer(logits: torch.Tensor) -> torch.Tensor:
+    """Per-row ``[rows, 2]`` fp32 ``(max, logsumexp - max)`` of 2D logits."""
+    row_max, row_log_sum = _row_lse_pair(logits)
+    return torch.stack((row_max, row_log_sum), dim=1)
+
+
+def _row_lse_pair(logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if logits.is_cuda:
+        from sglang.srt.layers.logsumexp import row_logsumexp
+
+        return row_logsumexp(logits)
+    logits = logits.float()
+    row_max = logits.max(dim=-1).values
+    row_log_sum = torch.log(torch.exp(logits - row_max[:, None]).sum(dim=-1))
+    return row_max, row_log_sum
 
 
 def configure_model_trie_output_heads(
@@ -157,16 +186,22 @@ class BeamTrieOutputHead:
                 hidden_states.shape[0], device=hidden_states.device
             )
             logits = all_logits[row_indices, depths]
-        normalizer = (
-            None
-            if use_topk_logprob()
-            else self._stream_normalizer(
+        # Match the dense path: logit_scale runs in the LM-head dtype, then
+        # scoring and softcapping consume FP32 logits.
+        logits = transform(logits).float()
+        if use_codebook_normalizer():
+            # Approximates log Z by the active codebook alone; the error per
+            # row is log(1 + outside_mass / codebook_mass).
+            normalizer = row_log_normalizer(logits)
+        elif use_topk_logprob():
+            normalizer = None
+        else:
+            normalizer = self._stream_normalizer(
                 hidden_states,
                 weight,
                 project,
                 transform,
             )
-        )
         return BeamTrieHeadOutput(logits, normalizer)
 
     def _stream_normalizer(
@@ -201,16 +236,7 @@ class BeamTrieOutputHead:
             )
             chunk_logits = project(hidden_states, weight[start:physical_end])
             chunk_logits = transform(chunk_logits)[:, : logical_end - start]
-            if chunk_logits.is_cuda:
-                from sglang.srt.layers.logsumexp import row_logsumexp
-
-                chunk_max, chunk_log_sum = row_logsumexp(chunk_logits)
-            else:
-                chunk_logits = chunk_logits.float()
-                chunk_max = chunk_logits.max(dim=-1).values
-                chunk_log_sum = torch.log(
-                    torch.exp(chunk_logits - chunk_max[:, None]).sum(dim=-1)
-                )
+            chunk_max, chunk_log_sum = _row_lse_pair(chunk_logits)
 
             if row_max is None:
                 row_max = chunk_max
@@ -225,3 +251,64 @@ class BeamTrieOutputHead:
 
         assert row_max is not None and row_log_sum is not None
         return torch.stack((row_max, row_log_sum), dim=1)
+
+
+class NormalizerGapStats:
+    """Windowed per-depth stats of ``exact_lse - codebook_lse`` per SID row.
+
+    The gap is the codebook normalizer's error, log(1 + outside / codebook
+    mass). Recording copies each gap to the host, so it is debug-only.
+    """
+
+    def __init__(self, interval: int):
+        self.interval = interval
+        self.records = 0
+        self.gaps: dict[int, list[torch.Tensor]] = {}
+
+    def record(self, depth: int, exact_lse: torch.Tensor, codebook_lse: torch.Tensor):
+        if exact_lse.is_cuda and torch.cuda.is_current_stream_capturing():
+            return
+        gap = (exact_lse.float() - codebook_lse.float()).reshape(-1)
+        self.gaps.setdefault(depth, []).append(gap.detach().cpu())
+        self.records += 1
+        if self.records % self.interval == 0:
+            for line in self.summarize():
+                logger.info(line)
+            self.gaps.clear()
+
+    def summarize(self) -> list[str]:
+        lines = []
+        for depth in sorted(self.gaps):
+            gaps = torch.cat(self.gaps[depth])
+            gaps = gaps[torch.isfinite(gaps)]
+            if gaps.numel() == 0:
+                continue
+            ordered = gaps.sort().values
+            n = ordered.numel()
+
+            def quantile(q: float) -> float:
+                return ordered[min(n - 1, int(q * (n - 1) + 0.5))].item()
+
+            outside_fraction = -torch.expm1(-gaps)
+            lines.append(
+                f"Beam trie normalizer gap depth={depth} rows={n} "
+                f"mean={gaps.mean().item():.4g} p50={quantile(0.5):.4g} "
+                f"p99={quantile(0.99):.4g} max={ordered[-1].item():.4g} "
+                f"outside_mass_mean={outside_fraction.mean().item():.4g}"
+            )
+        return lines
+
+
+_normalizer_gap_stats: Optional[NormalizerGapStats] = None
+
+
+def normalizer_gap_stats() -> Optional[NormalizerGapStats]:
+    """The process-wide gap recorder, or None when the diagnostic is off or
+    the scores are already approximate."""
+    global _normalizer_gap_stats
+    interval = envs.SGLANG_DEBUG_BEAM_TRIE_NORMALIZER_GAP_INTERVAL.get()
+    if interval <= 0 or use_topk_logprob() or use_codebook_normalizer():
+        return None
+    if _normalizer_gap_stats is None or _normalizer_gap_stats.interval != interval:
+        _normalizer_gap_stats = NormalizerGapStats(interval)
+    return _normalizer_gap_stats

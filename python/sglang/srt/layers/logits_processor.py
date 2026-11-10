@@ -30,9 +30,7 @@ from sglang.kernels.ops.activation.softcap import (
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
-from sglang.kernels.ops.activation.softcap import (
-    softcap_to_float32_logits,
-)
+from sglang.kernels.ops.activation.softcap import softcap_to_float32_logits
 from sglang.kernels.ops.sampling.softcap_row_argmax import softcap_row_argmax
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
@@ -1175,7 +1173,7 @@ class LogitsProcessor(nn.Module):
             )
         assert not self.do_tensor_parallel_all_gather
 
-        head_output = output_head.project_mixed(
+        return output_head.project_mixed(
             hidden_states,
             lm_head.weight,
             depths,
@@ -1183,10 +1181,6 @@ class LogitsProcessor(nn.Module):
             self._transform_beam_trie_logits,
             use_grouped_projection=not self.use_fp32_lm_head,
         )
-        # Match the dense path: logit_scale runs in the LM-head dtype, then
-        # scoring and softcapping consume FP32 logits.
-        logits = self._transform_beam_trie_logits(head_output.logits).float()
-        return BeamTrieHeadOutput(logits=logits, normalizer=head_output.normalizer)
 
     def _project_beam_trie_lm_head(
         self,
