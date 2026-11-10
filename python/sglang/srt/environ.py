@@ -735,6 +735,9 @@ class Envs:
     # Kill switch: finalize/pack/send finished beam groups inline instead of
     # during the next decode launch.
     SGLANG_DISABLE_BEAM_DEFERRED_OUTPUT = EnvBool(False)
+    # Kill switch: select trie decode groups one at a time instead of batching
+    # same-shape groups into one launch sequence.
+    SGLANG_DISABLE_BEAM_BATCHED_DECODE_SELECTION = EnvBool(False)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism

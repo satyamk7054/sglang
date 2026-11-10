@@ -43,6 +43,16 @@ from typing import TYPE_CHECKING, List, Optional, Sequence
 import msgspec
 import torch
 
+from sglang.srt.beam_search.batch_tail import BeamTailEntry
+from sglang.srt.beam_search.batched_select import (
+    advance_prefixes_batched,
+    gather_rows,
+    rank_candidates_batched,
+    regroup_trie_rows,
+    remap_kv_mapping_batched,
+    split_final_select,
+    split_no_stop_select,
+)
 from sglang.srt.beam_search.beam_group import BeamGroup, BeamGroupState
 from sglang.srt.beam_search.fork import (
     MEMBER_LENGTH_MARGIN,
@@ -117,6 +127,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
     _trie_selection_graph_cache: Optional[TrieSelectionGraphCache] = None
+    # Select same-shape trie decode groups together (set from the env kill
+    # switch in __post_init__).
+    batched_decode_selection: bool = True
     # Set by event loops that flush held outputs at decode launches: a finished
     # group's finalize/pack/send then runs while the next decode is on the GPU.
     defer_finished_outputs: bool = False
@@ -126,6 +139,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     _deferred_hold_launches: int = 0
 
     def __post_init__(self) -> None:
+        self.batched_decode_selection = (
+            not envs.SGLANG_DISABLE_BEAM_BATCHED_DECODE_SELECTION.get()
+        )
         config = self.model_config.beam_trie_config
         if config is not None:
             self.trie_constraint = BeamTrieConstraint.load(
@@ -435,10 +451,15 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if tail is None:
             return
         capture = logits_output.beam
-        for gi, entry in enumerate(tail.entries):
+        live = [
+            (gi, entry)
+            for gi, entry in enumerate(tail.entries)
+            if not entry.group.retired and entry.group.state == BeamGroupState.DECODING
+        ]
+        if self.trie_constraint is not None and self.batched_decode_selection:
+            live = self._select_and_relay_batched(capture, live, batch.forward_iter)
+        for gi, entry in live:
             group = entry.group
-            if group.retired or group.state != BeamGroupState.DECODING:
-                continue
             pieces = [
                 capture.leader_logits[gi : gi + 1],
                 capture.tail_logits[entry.start : entry.end],
@@ -468,6 +489,147 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 )
             next_tokens, parent_idx = selected
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
+
+    def _batched_select_key(self, entry: BeamTailEntry) -> Optional[tuple]:
+        """Bucket key for batched trie selection, or None for the per-group
+        path. Groups sharing a key select with one launch sequence."""
+        group = entry.group
+        k = group.beam_width
+        depth = group.num_generated
+        if (
+            k < 2
+            or not group.device_history
+            or not 1 <= depth < self.trie_constraint.config.num_codebooks
+            or entry.end - entry.start != k - 1
+            or group.all_rows is None
+            or group.all_rows.shape != (k,)
+            or group.frontier_cum_logprobs.shape != (k,)
+            or group.trie_prefix_codes is None
+            or group.trie_prefix_codes.shape != (k, depth)
+        ):
+            return None
+        final = group.next_step_is_final()
+        # Final steps skip the KV remap, so their window does not matter.
+        window = None if final else group.leader.kv.kv_committed_len - group.prompt_len
+        return (k, depth, final, window)
+
+    def _select_and_relay_batched(
+        self, capture, live: List[tuple], tick: int
+    ) -> List[tuple]:
+        """Select every bucket of two or more same-key trie groups at once;
+        returns the (gi, entry) pairs left for the per-group path."""
+        buckets: dict = {}
+        for item in live:
+            key = self._batched_select_key(item[1])
+            buckets.setdefault(key, []).append(item)
+        rest = buckets.pop(None, [])
+        for key, items in buckets.items():
+            if len(items) < 2:
+                rest.extend(items)
+                continue
+            self._select_bucket(capture, key, items, tick)
+        # Keep the per-group path in batch order.
+        rest.sort(key=lambda item: item[0])
+        return rest
+
+    def _bucket_candidates(self, capture, items, depth: int):
+        """Per-row trie top-k of a bucket as (leader, member) views of
+        [G, C] / [G, k-1, C] values and tokens."""
+        groups = [entry.group for _, entry in items]
+        num_groups = len(groups)
+        leader_ranges = [(gi, gi + 1) for gi, _ in items]
+        if (
+            capture.leader_normalizer is None
+            or capture.leader_logits.shape[1]
+            != self.trie_constraint.config.codebook_size
+        ):
+            # The lse paths reduce over each piece; batching would change
+            # their reduction shape, so they keep per-group pieces.
+            per_group = [
+                self._group_topk_logprobs(
+                    entry.group,
+                    [
+                        capture.leader_logits[gi : gi + 1],
+                        capture.tail_logits[entry.start : entry.end],
+                    ],
+                    self._capture_normalizers(
+                        capture,
+                        leader_slice=slice(gi, gi + 1),
+                        tail_slice=slice(entry.start, entry.end),
+                    ),
+                )
+                for gi, entry in items
+            ]
+            values = torch.stack([v for v, _ in per_group])
+            tokens = torch.stack([t for _, t in per_group])
+            return values[:, 0], values[:, 1:], tokens[:, 0], tokens[:, 1:]
+        # Compact logits with a full-vocabulary normalizer: every op is per row
+        # or elementwise, so leaders-then-tails rows match the per-group pieces.
+        tail_ranges = [(entry.start, entry.end) for _, entry in items]
+        pieces = [
+            gather_rows(capture.leader_logits, leader_ranges, self._to_device),
+            gather_rows(capture.tail_logits, tail_ranges, self._to_device),
+        ]
+        normalizers = [
+            gather_rows(capture.leader_normalizer, leader_ranges, self._to_device),
+            gather_rows(capture.tail_normalizer, tail_ranges, self._to_device),
+        ]
+        prefixes = torch.stack([g.trie_prefix_codes for g in groups])
+        row_prefixes = torch.cat([prefixes[:, 0], prefixes[:, 1:].reshape(-1, depth)])
+        values, tokens = self.trie_constraint.topk_logprobs(
+            pieces, row_prefixes, depth, groups[0].beam_width, normalizers
+        )
+        return (
+            *regroup_trie_rows(values, num_groups),
+            *regroup_trie_rows(tokens, num_groups),
+        )
+
+    def _select_bucket(self, capture, key: tuple, items, tick: int) -> None:
+        k, depth, final, window = key
+        groups = [entry.group for _, entry in items]
+        leader_v, member_v, leader_t, member_t = self._bucket_candidates(
+            capture, items, depth
+        )
+        cum_logprobs = torch.stack([g.frontier_cum_logprobs for g in groups])
+        scores, parent, tokens = rank_candidates_batched(
+            cum_logprobs, leader_v, member_v, leader_t, member_t, num_out=k
+        )
+        rows = torch.stack([g.all_rows for g in groups])
+        if final:
+            for group, sel in zip(groups, split_final_select(scores, parent, tokens)):
+                group.advance_final_frontier(sel, tick)
+            self._stash_next_tokens(rows.view(-1), tokens.view(-1))
+            return
+
+        for group, sel in zip(groups, split_no_stop_select(scores, parent, tokens)):
+            group.advance_frontier(sel, tick)
+        new_prefixes = advance_prefixes_batched(
+            torch.stack([g.trie_prefix_codes for g in groups]),
+            parent,
+            tokens,
+            self.trie_constraint.config.token_start_for_depth(depth),
+        )
+        old_mapping, new_mapping = remap_kv_mapping_batched(
+            self.req_to_token_pool.req_to_token,
+            rows,
+            parent,
+            self._to_device(torch.tensor([g.prompt_len for g in groups])),
+            window,
+        )
+        for g, group in enumerate(groups):
+            group.trie_prefix_codes = new_prefixes[g]
+            group.pending_orphans.append(
+                StagedOrphans(tick, old_mapping[g], new_mapping[g])
+            )
+            group.leader.output_ids.append(0)
+        self._stash_next_tokens(rows.view(-1), tokens.view(-1))
+
+    def _to_device(self, host: torch.Tensor) -> torch.Tensor:
+        # Pinned + non_blocking: a pageable H2D copy would block the host.
+        device = torch.device(self.req_to_token_pool.device)
+        if device.type != "cuda":
+            return host.to(device)
+        return host.pin_memory().to(device, non_blocking=True)
 
     def commit_decode(self, batch: ScheduleBatch) -> set:
         """Deferred half: fold staged selections into the DAG and apply
