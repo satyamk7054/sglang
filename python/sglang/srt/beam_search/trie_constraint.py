@@ -358,8 +358,17 @@ class BeamTrieConstraint:
 
         Dense logits preserve the full-vocabulary score exactly: normalize over the
         full vocabulary, then gather valid SID tokens. Compact logits use a
-        streamed full-vocabulary normalizer supplied by the output head.
+        streamed full-vocabulary normalizer supplied by the output head. With
+        SGLANG_OPT_BEAM_TRIE_CODEBOOK_NORMALIZER both normalize over the active
+        codebook instead.
         """
+        from sglang.srt.beam_search.trie_output_head import (
+            normalizer_gap_stats,
+            use_codebook_normalizer,
+        )
+
+        codebook_normalizer = use_codebook_normalizer()
+        gap_stats = normalizer_gap_stats()
 
         sparse_cuda = (
             depth == 2
@@ -394,6 +403,12 @@ class BeamTrieConstraint:
                     raise ValueError(
                         "Beam trie normalizer rows must match compact logits"
                     )
+                if gap_stats is not None:
+                    gap_stats.record(
+                        depth,
+                        normalizer[:, 0].float() + normalizer[:, 1].float(),
+                        torch.logsumexp(x, dim=-1),
+                    )
                 codebook_logits = x
             else:
                 token_end = token_start + size
@@ -424,8 +439,17 @@ class BeamTrieConstraint:
             t = torch.where(torch.isneginf(v), fallback, t)
             if compact:
                 vals.append((v - normalizer[:, :1].float()) - normalizer[:, 1:].float())
+            elif codebook_normalizer:
+                vals.append(v - torch.logsumexp(codebook_logits, dim=-1, keepdim=True))
             else:
-                vals.append(v - torch.logsumexp(x, dim=-1, keepdim=True))
+                lse = torch.logsumexp(x, dim=-1, keepdim=True)
+                if gap_stats is not None:
+                    gap_stats.record(
+                        depth,
+                        lse,
+                        torch.logsumexp(codebook_logits, dim=-1, keepdim=True),
+                    )
+                vals.append(v - lse)
             toks.append(t + token_start)
         if row_start != prefix_codes.shape[0]:
             raise ValueError(

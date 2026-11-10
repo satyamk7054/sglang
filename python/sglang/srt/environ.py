@@ -749,6 +749,13 @@ class Envs:
     # ===================================================================
     # Beam search
     # ===================================================================
+    # Approximate each SID row's log-softmax normalizer by the logsumexp over
+    # its active codebook only, skipping the full-vocabulary normalizer
+    # matmuls. Off keeps the exact full-vocabulary score.
+    SGLANG_OPT_BEAM_TRIE_CODEBOOK_NORMALIZER = EnvBool(False)
+    # Debug: every N trie selections, log per-depth stats of the exact
+    # full-vocabulary lse minus the active-codebook lse. Syncs the GPU; 0 is off.
+    SGLANG_DEBUG_BEAM_TRIE_NORMALIZER_GAP_INTERVAL = EnvInt(0)
     # Shared-prompt decode attention for wide beam batches (FlashInfer MHA only).
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
