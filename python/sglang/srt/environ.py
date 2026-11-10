@@ -751,7 +751,7 @@ class Envs:
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
     # Kill switch: finalize/pack/send finished beam groups inline instead of
-    # after the next batch launch.
+    # during the next decode launch.
     SGLANG_DISABLE_BEAM_DEFERRED_OUTPUT = EnvBool(False)
 
     # ===================================================================

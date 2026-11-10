@@ -2213,8 +2213,7 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
-                # Held beam outputs run while this forward is on the GPU.
-                self.flush_deferred_beam_outputs()
+                self.maybe_flush_deferred_beam_outputs_after_launch(batch)
                 self.process_batch_result(batch, result)
             else:
                 self.flush_deferred_beam_outputs()
@@ -2300,8 +2299,7 @@ class Scheduler(
                 self.launch_batch_sample_if_needed(batch_result, batch)
 
             if batch:
-                # Held beam outputs run while this batch is on the GPU.
-                self.flush_deferred_beam_outputs()
+                self.maybe_flush_deferred_beam_outputs_after_launch(batch)
 
             # Update last_batch
             self.last_batch = batch
@@ -3034,8 +3032,9 @@ class Scheduler(
             )
 
     def enable_beam_deferred_output(self) -> None:
-        """Opt in from an event loop that calls flush_deferred_beam_outputs
-        after every launch and before every idle sleep."""
+        """Opt in from an event loop that calls
+        maybe_flush_deferred_beam_outputs_after_launch after every launch and
+        flush_deferred_beam_outputs before every idle sleep."""
         if envs.SGLANG_DISABLE_BEAM_DEFERRED_OUTPUT.get():
             return
         self.beam_coordinator.defer_finished_outputs = True
@@ -3048,6 +3047,16 @@ class Scheduler(
             return
         leaders = self.beam_coordinator.take_deferred_outputs()
         self.output_streamer.stream_output(leaders, False)
+
+    def maybe_flush_deferred_beam_outputs_after_launch(
+        self, batch: ScheduleBatch
+    ) -> None:
+        """Fallback after a launch; decode launches already flushed before
+        their selection in _relay_forward_payload."""
+        if self.beam_coordinator.should_flush_after_launch(
+            batch.forward_mode.is_decode()
+        ):
+            self.flush_deferred_beam_outputs()
 
     def init_batch_result_processor(self) -> None:
         self.batch_result_processor = SchedulerBatchResultProcessor(
@@ -5772,6 +5781,10 @@ class Scheduler(
             accepted_lengths=batch_result.accept_lens,
             allow_defer=batch.beam_tail is None,
         )
+        if batch.forward_mode.is_decode():
+            # Held beam outputs run while this decode is on the GPU, before its
+            # selection waits on it.
+            self.flush_deferred_beam_outputs()
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )
