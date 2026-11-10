@@ -1,5 +1,5 @@
 """Deferred beam output: a finished group frees its rows at commit, while its
-finalize/pack/send is held until the scheduler flushes after the next launch.
+finalize/pack/send is held until the next decode launch (or a fallback point).
 The held path must produce exactly the inline path's results."""
 
 import unittest
@@ -206,6 +206,101 @@ class TestSchedulerFlush(CustomTestCase):
                 Scheduler.enable_beam_deferred_output(scheduler)
             self.assertEqual(coordinator.defer_finished_outputs, not disabled)
             self.assertEqual(streamer.defer_outputs, not disabled)
+
+
+def held_coordinator(num_live_groups):
+    """A coordinator holding one finished group's output."""
+    group = BeamGroup(beam_width=2, max_new_tokens=3, device_history=True)
+    run_to_length_finish(group)
+    coordinator = make_coordinator()
+    coordinator.defer_finished_outputs = True
+    with mock.patch.object(BeamCoordinator, "_free_member_rows"):
+        coordinator._num_live_groups = 1
+        leader = FakeLeader(group)
+        coordinator._finish_group(group)
+    coordinator._num_live_groups = num_live_groups
+    return coordinator, leader
+
+
+def fake_batch(decode):
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode=lambda: decode), beam_tail=None
+    )
+
+
+class TestFlushPolicy(CustomTestCase):
+    def test_nothing_held_never_flushes(self):
+        coordinator = make_coordinator()
+        coordinator._num_live_groups = 0
+        self.assertFalse(coordinator.should_flush_after_launch(is_decode=True))
+        self.assertFalse(coordinator.should_flush_after_launch(is_decode=False))
+
+    def test_decode_launch_flushes(self):
+        coordinator, _ = held_coordinator(num_live_groups=3)
+        self.assertTrue(coordinator.should_flush_after_launch(is_decode=True))
+
+    def test_prefill_launch_holds_while_decode_is_due(self):
+        coordinator, _ = held_coordinator(num_live_groups=3)
+        bound = coordinator.max_deferred_output_hold_launches
+        for _ in range(bound - 1):
+            self.assertFalse(coordinator.should_flush_after_launch(is_decode=False))
+        self.assertTrue(coordinator.should_flush_after_launch(is_decode=False))
+        coordinator.take_deferred_outputs()
+        self.assertEqual(coordinator._deferred_hold_launches, 0)
+
+    def test_prefill_launch_flushes_without_live_groups(self):
+        coordinator, _ = held_coordinator(num_live_groups=0)
+        self.assertTrue(coordinator.should_flush_after_launch(is_decode=False))
+
+    def test_after_launch_fallback(self):
+        for decode, live, flushed in (
+            (False, 2, False),
+            (False, 0, True),
+            (True, 2, True),
+        ):
+            coordinator, leader = held_coordinator(num_live_groups=live)
+            streamer = mock.Mock()
+            scheduler = SimpleNamespace(
+                beam_coordinator=coordinator, output_streamer=streamer
+            )
+            scheduler.flush_deferred_beam_outputs = lambda s=scheduler: (
+                Scheduler.flush_deferred_beam_outputs(s)
+            )
+            Scheduler.maybe_flush_deferred_beam_outputs_after_launch(
+                scheduler, fake_batch(decode)
+            )
+            self.assertEqual(streamer.stream_output.called, flushed)
+            self.assertEqual(coordinator.has_deferred_outputs(), not flushed)
+
+
+class TestRelayFlush(CustomTestCase):
+    def _relay(self, decode):
+        calls = mock.Mock()
+        scheduler = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_ngram=lambda: False),
+            uocr_runtime=None,
+            future_map=SimpleNamespace(stash=lambda *args: None),
+            beam_coordinator=SimpleNamespace(
+                maybe_select_and_relay=calls.select_and_relay
+            ),
+            flush_deferred_beam_outputs=calls.flush,
+            chunked_req=None,
+        )
+        batch_result = SimpleNamespace(
+            next_draft_input=None,
+            has_sampled_token_ids=True,
+            next_token_ids=torch.zeros(1, dtype=torch.int64),
+        )
+        Scheduler._relay_forward_payload(
+            scheduler, fake_batch(decode), torch.zeros(1), batch_result
+        )
+        return [c[0] for c in calls.mock_calls]
+
+    def test_decode_flushes_before_selection(self):
+        self.assertEqual(self._relay(decode=True), ["flush", "select_and_relay"])
+
+    def test_prefill_does_not_flush(self):
+        self.assertEqual(self._relay(decode=False), ["select_and_relay"])
 
 
 if __name__ == "__main__":

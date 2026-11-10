@@ -733,7 +733,7 @@ class Envs:
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT = EnvInt(32768)
     SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE = EnvInt(8)
     # Kill switch: finalize/pack/send finished beam groups inline instead of
-    # after the next batch launch.
+    # during the next decode launch.
     SGLANG_DISABLE_BEAM_DEFERRED_OUTPUT = EnvBool(False)
 
     # ===================================================================

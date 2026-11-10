@@ -117,10 +117,13 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
     _trie_selection_graph_cache: Optional[TrieSelectionGraphCache] = None
-    # Set by event loops that flush held outputs after each launch: a finished
-    # group's finalize/pack/send then runs while the next batch is on the GPU.
+    # Set by event loops that flush held outputs at decode launches: a finished
+    # group's finalize/pack/send then runs while the next decode is on the GPU.
     defer_finished_outputs: bool = False
+    # Non-decode launches an output may be held across while a decode is due.
+    max_deferred_output_hold_launches: int = 4
     _deferred_output_leaders: List[Req] = msgspec.field(default_factory=list)
+    _deferred_hold_launches: int = 0
 
     def __post_init__(self) -> None:
         config = self.model_config.beam_trie_config
@@ -644,10 +647,22 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     def has_deferred_outputs(self) -> bool:
         return bool(self._deferred_output_leaders)
 
+    def should_flush_after_launch(self, is_decode: bool) -> bool:
+        """Whether held outputs go out right after this launch. A prefill is too
+        short to hide them, so they wait for the next decode unless no beam
+        group is live (no decode is due) or the hold bound is reached."""
+        if not self._deferred_output_leaders:
+            return False
+        if is_decode or self._num_live_groups == 0:
+            return True
+        self._deferred_hold_launches += 1
+        return self._deferred_hold_launches >= self.max_deferred_output_hold_launches
+
     def take_deferred_outputs(self) -> List[Req]:
         """Finalize the held finished groups and release their leaders for
         streaming, in finish order."""
         leaders, self._deferred_output_leaders = self._deferred_output_leaders, []
+        self._deferred_hold_launches = 0
         for leader in leaders:
             group = leader.beam_group
             if group.final_results is None:
