@@ -88,6 +88,10 @@ def results_of(results):
     return [(r.tokens, r.cum_logprob, r.beam_score, r.matched_token) for r in results]
 
 
+def columnar_of(columnar):
+    return columnar.tokens.tolist(), columnar.beam_scores.tolist()
+
+
 class TestStagedFinalize(CustomTestCase):
     def test_staged_finalize_matches_direct(self):
         direct = BeamGroup(beam_width=2, max_new_tokens=3, device_history=True)
@@ -125,7 +129,7 @@ class TestCoordinatorDeferredFinish(CustomTestCase):
         self.assertEqual(free_rows.call_count, 2)
         self.assertTrue(held.retired)
         self.assertEqual(coordinator._num_live_groups, 0)
-        self.assertIsNone(held.final_results)
+        self.assertIsNone(held.final_columnar)
         self.assertTrue(leader.defer_output)
         self.assertTrue(coordinator.has_deferred_outputs())
         self.assertIsInstance(leader.finished_reason, FINISH_LENGTH)
@@ -137,7 +141,7 @@ class TestCoordinatorDeferredFinish(CustomTestCase):
         self.assertFalse(leader.defer_output)
         self.assertFalse(coordinator.has_deferred_outputs())
         self.assertEqual(
-            results_of(held.final_results), results_of(inline.final_results)
+            columnar_of(held.final_columnar), columnar_of(inline.final_columnar)
         )
 
     def test_host_history_keeps_stop_finish_reason(self, free_rows):
@@ -176,7 +180,7 @@ class TestCoordinatorDeferredFinish(CustomTestCase):
         leader = self._finish(coordinator, group)
         self.assertFalse(leader.defer_output)
         self.assertFalse(coordinator.has_deferred_outputs())
-        self.assertEqual(len(group.final_results), 2)
+        self.assertEqual(group.final_columnar.tokens.shape, (2, 3))
 
 
 class TestSchedulerFlush(CustomTestCase):
@@ -196,7 +200,7 @@ class TestSchedulerFlush(CustomTestCase):
         )
         Scheduler.flush_deferred_beam_outputs(scheduler)
         streamer.stream_output.assert_called_once_with([leader], False)
-        self.assertEqual(len(group.final_results), 2)
+        self.assertEqual(group.final_columnar.tokens.shape, (2, 3))
 
         Scheduler.flush_deferred_beam_outputs(scheduler)
         streamer.stream_output.assert_called_once()

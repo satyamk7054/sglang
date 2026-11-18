@@ -27,6 +27,7 @@ import enum
 from typing import List, Optional, Sequence
 
 import msgspec
+import numpy as np
 import torch
 
 from sglang.srt.beam_search.fork import StagedOrphans
@@ -55,6 +56,15 @@ class BeamResult(msgspec.Struct):
     cum_logprob: float
     beam_score: float
     matched_token: Optional[int]
+
+
+class ColumnarBeamResults(msgspec.Struct, frozen=True):
+    """A device-history group's returned sequences, best score first: all
+    length-finished at the same length, so they stay two arrays instead of a
+    BeamResult per sequence."""
+
+    tokens: np.ndarray  # int32 [n, length]
+    beam_scores: np.ndarray  # float64 [n]
 
 
 class BeamGroup:
@@ -91,6 +101,8 @@ class BeamGroup:
         self.completed: List[CompletedBeam] = []
         # Set at finish; None while a deferred finalize is pending.
         self.final_results: Optional[List[BeamResult]] = None
+        # Device-history groups finish here instead of in final_results.
+        self.final_columnar: Optional[ColumnarBeamResults] = None
         self.state = BeamGroupState.DECODING
         self.device_history = device_history
         self._device_tokens: List[torch.Tensor] = []
@@ -318,6 +330,30 @@ class BeamGroup:
         else:
             host_tokens, host_cums, ready = tokens.cpu(), cum_logprobs.cpu(), None
         self._host_final = (host_tokens, host_cums, ready)
+
+    def finalize_columnar(self) -> ColumnarBeamResults:
+        """The top min(beam_width, num_return) sequences of a device-history
+        group as arrays, in finalize's order and with its exact scores."""
+        assert self.state == BeamGroupState.FINISHED and self.device_history
+        if self._host_final is None:
+            self.stage_final_results()
+        host_tokens, host_cums, ready = self._host_final
+        self._host_final = None
+        if ready is not None:
+            ready.synchronize()
+        # float32 -> float64 is exact and both divide by the same Python float,
+        # so the scores equal finalize's beam_score bit for bit.
+        beam_scores = host_cums.numpy().astype(np.float64) / (
+            self.num_committed**self.length_penalty
+        )
+        # Stable descending sort: equal scores keep row order, like finalize's
+        # list.sort(reverse=True).
+        order = np.argsort(-beam_scores, kind="stable")
+        order = order[: min(self.beam_width, self.num_return)]
+        return ColumnarBeamResults(
+            tokens=host_tokens.numpy()[order].astype(np.int32),
+            beam_scores=beam_scores[order],
+        )
 
     def finalize(self) -> List[BeamResult]:
         """Materialize the top beam_width sequences, best score first."""
