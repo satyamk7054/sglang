@@ -127,6 +127,14 @@ class MMInputsProcessError(msgspec.Struct, frozen=True):
 
 class BeamSearchOutput(BaseBatchReq, kw_only=True):
     sequences: List[BeamSearchSequence]
+    # Columnar form for fixed-length (trie) groups, with `sequences` empty:
+    # every sequence finished by length at `columnar_length` tokens. Expanded
+    # into per-beam results only on the tokenizer side.
+    columnar_tokens: Optional[bytes] = None  # int32 [n, columnar_length]
+    columnar_scores: Optional[bytes] = None  # float64 [n], best first
+    columnar_length: int = 0
+    # Per-sequence texts of the columnar form, filled by the detokenizer.
+    columnar_texts: Optional[List[str]] = None
 
 
 class PickleWrapper(msgspec.Struct, tag=True, array_like=True):

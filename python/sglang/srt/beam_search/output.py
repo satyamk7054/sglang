@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
+import numpy as np
+
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.io_struct import (
@@ -43,6 +45,16 @@ def pack_beam_search_output(req: Req) -> Optional[BeamSearchOutput]:
     from sglang.srt.managers.req_types import FINISH_LENGTH, FINISH_MATCHED_TOKEN
 
     group = req.beam_group
+    columnar = group.final_columnar
+    if columnar is not None:
+        if columnar.tokens.shape[0] == 0:
+            return None
+        return BeamSearchOutput(
+            sequences=[],
+            columnar_tokens=columnar.tokens.tobytes(),
+            columnar_scores=columnar.beam_scores.tobytes(),
+            columnar_length=columnar.tokens.shape[1],
+        )
     results = getattr(group, "final_results", None)
     if not results:
         return None
@@ -64,9 +76,24 @@ def pack_beam_search_output(req: Req) -> Optional[BeamSearchOutput]:
     return BeamSearchOutput(sequences=sequences)
 
 
+def is_columnar(beam_output: BeamSearchOutput) -> bool:
+    return beam_output.columnar_tokens is not None
+
+
+def columnar_num_sequences(beam_output: BeamSearchOutput) -> int:
+    return len(beam_output.columnar_scores) // 8
+
+
+def columnar_token_rows(beam_output: BeamSearchOutput) -> List[List[int]]:
+    tokens = np.frombuffer(beam_output.columnar_tokens, dtype=np.int32)
+    return tokens.reshape(-1, beam_output.columnar_length).tolist()
+
+
 def beam_completion_tokens(beam_output: BeamSearchOutput) -> int:
     """A group's completion_tokens: the total across its returned sequences
     (the leader row's output_ids is a length placeholder, not output)."""
+    if is_columnar(beam_output):
+        return columnar_num_sequences(beam_output) * beam_output.columnar_length
     return sum(len(seq.tokens) for seq in beam_output.sequences)
 
 
@@ -85,11 +112,33 @@ def decode_beam_search_output(
     trim_matched_stop: Callable,
 ) -> None:
     """Fill each candidate sequence's `text` in place."""
+    for i, beam_output in enumerate(recv_obj.beam_search_output):
+        if beam_output is None or headers[i] is None or not is_columnar(beam_output):
+            continue
+        # Length-finished sequences: nothing to trim.
+        header = headers[i]
+        token_rows = columnar_token_rows(beam_output)
+        if disable_batch_decode:
+            beam_output.columnar_texts = [
+                tokenizer.decode(
+                    tokens,
+                    skip_special_tokens=header.skip_special_tokens,
+                    spaces_between_special_tokens=header.spaces_between_special_tokens,
+                )
+                for tokens in token_rows
+            ]
+        else:
+            beam_output.columnar_texts = tokenizer.batch_decode(
+                token_rows,
+                skip_special_tokens=header.skip_special_tokens,
+                spaces_between_special_tokens=header.spaces_between_special_tokens,
+            )
     if disable_batch_decode:
         for i, beam_output in enumerate(recv_obj.beam_search_output):
             header = headers[i]
-            if beam_output is None or header is None:
-                # A non-beam item of a mixed batch, or a row with no detokenize state.
+            if beam_output is None or header is None or is_columnar(beam_output):
+                # A non-beam item of a mixed batch, a row with no detokenize
+                # state, or a columnar output (decoded above).
                 continue
             for beam in beam_output.sequences:
                 # A group's returned beams mix stop-finished and length-finished
@@ -109,8 +158,9 @@ def decode_beam_search_output(
         # request; batching all would apply request 0's flags to everyone.
         for i, beam_output in enumerate(recv_obj.beam_search_output):
             header = headers[i]
-            if beam_output is None or header is None:
-                # A non-beam item of a mixed batch, or a row with no detokenize state.
+            if beam_output is None or header is None or is_columnar(beam_output):
+                # A non-beam item of a mixed batch, a row with no detokenize
+                # state, or a columnar output (decoded above).
                 continue
             trimmed_tokens = [
                 trim_matched_stop(
@@ -163,10 +213,8 @@ def try_build_beam_search_out_dict(
         if recv_obj.beam_search_output and i < len(recv_obj.beam_search_output)
         else None
     )
-    has_beam_search = (
-        beam_search_output is not None
-        and hasattr(beam_search_output, "sequences")
-        and beam_search_output.sequences
+    has_beam_search = beam_search_output is not None and (
+        beam_search_output.sequences or is_columnar(beam_search_output)
     )
     if not has_beam_search or recv_obj.finished_reasons[i] is None:
         return None
@@ -180,6 +228,10 @@ def _build_beam_search_out_dict(
     recv_obj: Union[BatchStrOutput, BatchTokenIDOutput],
 ) -> dict:
     include_text = isinstance(recv_obj, BatchStrOutput)
+    if is_columnar(beam_search_output):
+        return _build_columnar_beam_search_out_dict(
+            beam_search_output, meta_info, include_text
+        )
     beam_results = []
     total_completion_tokens = beam_completion_tokens(beam_search_output)
     for idx, beam_seq in enumerate(beam_search_output.sequences):
@@ -199,4 +251,32 @@ def _build_beam_search_out_dict(
 
         beam_results.append(beam_out_dict)
 
+    return {"beam_results": beam_results}
+
+
+def _build_columnar_beam_search_out_dict(
+    beam_search_output: BeamSearchOutput,
+    meta_info: Dict[str, Any],
+    include_text: bool,
+) -> dict:
+    """The per-beam out dict of the columnar form, identical to what the
+    per-sequence form gives for the same length-finished sequences."""
+    length = beam_search_output.columnar_length
+    token_rows = columnar_token_rows(beam_search_output)
+    scores = np.frombuffer(beam_search_output.columnar_scores, dtype=np.float64)
+    texts = beam_search_output.columnar_texts
+    beam_results = []
+    for idx, (tokens, score) in enumerate(zip(token_rows, scores.tolist())):
+        beam_out_dict = {"output_ids": tokens}
+        if include_text:
+            beam_out_dict["text"] = (texts[idx] or "") if texts else ""
+        if idx == 0:
+            beam_meta_info = meta_info.copy()
+            beam_meta_info["completion_tokens"] = len(token_rows) * length
+        else:
+            beam_meta_info = {}
+        beam_meta_info["finish_reason"] = {"type": "length", "length": length}
+        beam_meta_info["sequence_score"] = score
+        beam_out_dict["meta_info"] = beam_meta_info
+        beam_results.append(beam_out_dict)
     return {"beam_results": beam_results}

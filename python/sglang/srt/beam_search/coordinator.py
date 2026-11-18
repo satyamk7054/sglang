@@ -783,11 +783,13 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         # Deferred: free the rows now so the next wave can be admitted, and hold
         # finalize/pack/send until take_deferred_outputs.
         defer = self.defer_finished_outputs
-        if defer and group.device_history:
+        if group.device_history:
             # Device-history results never end on a stop token, so the finish
             # reason needs no finalize; only the D2H copy starts here.
             group.stage_final_results()
             leader.finish_outside_step(FINISH_LENGTH(length=group.num_committed))
+            if not defer:
+                group.final_columnar = group.finalize_columnar()
         else:
             # The leader carries the best sequence's finish reason.
             group.final_results = group.finalize()
@@ -825,7 +827,10 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         self._deferred_hold_launches = 0
         for leader in leaders:
             group = leader.beam_group
-            if group.final_results is None:
+            if group.device_history:
+                if group.final_columnar is None:
+                    group.final_columnar = group.finalize_columnar()
+            elif group.final_results is None:
                 group.final_results = group.finalize()
             leader.defer_output = False
         return leaders
